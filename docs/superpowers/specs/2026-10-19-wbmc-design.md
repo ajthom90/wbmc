@@ -1,6 +1,6 @@
 # WBMC (World's Best Mail Client): Product Design
 
-*Status: draft for owner review · 2026-10-19*
+*Status: approved by owner · 2026-10-19*
 
 Items marked **[Claude's call]** are decisions the owner handed to Claude. Everything else was stated or approved by the owner.
 
