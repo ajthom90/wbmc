@@ -1,0 +1,68 @@
+name: WBMC
+options:
+  deploymentTarget:
+    macOS: "26.0"
+packages:
+  WBMCCoreKit:
+    path: WBMCCoreKit
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_APP_SANDBOX: NO
+    GENERATE_INFOPLIST_FILE: YES
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  WBMC-macOS:
+    productName: WBMC
+    type: application
+    platform: macOS
+    sources: [macOS, Shared]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.ajthom90.wbmc
+        PRODUCT_NAME: WBMC
+        PRODUCT_MODULE_NAME: WBMC
+        CODE_SIGN_ENTITLEMENTS: macOS/WBMC.entitlements
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+      configs:
+        Debug:
+          ENABLE_HARDENED_RUNTIME: NO
+    dependencies:
+      - package: WBMCCoreKit
+        product: WBMCCore
+  WBMC-macOSTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [Tests]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.ajthom90.wbmc.tests
+        ENABLE_HARDENED_RUNTIME: NO
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/WBMC.app/Contents/MacOS/WBMC"
+    dependencies:
+      - target: WBMC-macOS
+  WBMC-macOSUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources: [UITests]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.ajthom90.wbmc.uitests
+        ENABLE_HARDENED_RUNTIME: NO
+    dependencies:
+      - target: WBMC-macOS
+schemes:
+  WBMC-macOS:
+    build:
+      targets:
+        WBMC-macOS: all
+    test:
+      environmentVariables:
+        WBMC_SECRETS: memory
+        WBMC_DATA_DIR: "$(PROJECT_DIR)/../../build/UnitTestData"
+      targets: [WBMC-macOSTests, WBMC-macOSUITests]

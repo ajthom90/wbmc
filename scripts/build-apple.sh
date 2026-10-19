@@ -22,7 +22,7 @@ for target in "${targets[@]}"; do
 done
 
 for target in "${targets[@]}"; do
-    cargo build -p wbmc-ffi --release --target "$target"
+    cargo build -p wbmc-ffi --features debug-tools --release --target "$target"
 done
 
 work="$(mktemp -d)"
