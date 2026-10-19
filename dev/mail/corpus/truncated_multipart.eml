@@ -1,0 +1,15 @@
+From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Date: Mon, 19 Oct 2026 10:00:00 +0000
+Subject: Truncated
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset=utf-8
+
+This text survives truncation.
+--alt
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>cut off he
