@@ -5,3 +5,4 @@ apps/apple/*.xcodeproj
 apps/apple/WBMCCoreKit/Sources/WBMCCore/Generated/
 .DS_Store
 build/
+dev/mail/dovecot-data/

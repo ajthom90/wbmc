@@ -29,4 +29,5 @@ uniffi = { version = "0.32", features = ["tokio"] }
 wbmc-core = { path = "../wbmc-core" }
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = "3.27.0"

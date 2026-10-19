@@ -14,3 +14,18 @@ services:
       - "3143:3143"
       - "3465:3465"
       - "3993:3993"
+
+  # 50k benchmark mailbox. Not started by `docker compose up` without --profile big.
+  dovecot:
+    profiles: ["big"]
+    image: dovecot/dovecot:2.4.5
+    environment:
+      USER_PASSWORD: password
+    cap_add:
+      - SYS_CHROOT
+    ports:
+      - "127.0.0.1:4143:31143"
+      - "127.0.0.1:4993:31993"
+    volumes:
+      - ./dovecot/wbmc.conf:/etc/dovecot/conf.d/zz-wbmc.conf:ro
+      - ./dovecot-data:/srv/vmail

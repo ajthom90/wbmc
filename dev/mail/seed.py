@@ -4,6 +4,11 @@
 Uses only the Python standard library. Idempotent: if alice's INBOX already
 contains "Seed message 0499", the script prints a note and exits unless
 --force is passed.
+
+``--dovecot-maildir DIR`` writes the 50,000-message mailbox straight into a
+Maildir tree (plus the corpus) for the Dovecot service. It does not talk to
+IMAP. It skips when the last generated file is already present, unless
+--force is passed.
 """
 
 from __future__ import annotations
@@ -46,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         "--force",
         action="store_true",
         help="send even when INBOX already contains the seed marker",
+    )
+    parser.add_argument(
+        "--dovecot-maildir",
+        metavar="DIR",
+        help="write 50,000 Maildir files (and the corpus) under DIR instead of SMTP",
     )
     return parser.parse_args()
 
@@ -140,8 +150,57 @@ def inbox_count() -> int:
             pass
 
 
+def maildir_name(index: int) -> str:
+    return f"{index:06d}.M000000P1.wbmc.test"
+
+
+def write_dovecot_maildir(root: Path, force: bool) -> None:
+    count = 50_000
+    home = root / "alice@wbmc.test"
+    maildir = home / "Maildir"
+    new = maildir / "new"
+    for directory in (new, maildir / "cur", maildir / "tmp"):
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o777)
+    for directory in (root, home, maildir):
+        os.chmod(directory, 0o777)
+
+    marker = new / maildir_name(count - 1)
+    if marker.exists() and not force:
+        existing = sum(1 for path in new.iterdir() if path.is_file())
+        print(
+            f"maildir already contains {marker.name}; skipping "
+            f"(pass --force to rewrite). files in new/={existing}"
+        )
+        return
+
+    corpus = sorted(CORPUS_DIR.glob("*.eml"))
+    if not corpus:
+        raise SystemExit(f"no corpus messages in {CORPUS_DIR}")
+
+    for index, path in enumerate(corpus):
+        dest = new / f"c{index:02d}.M000000P1.wbmc.test"
+        dest.write_bytes(to_crlf(path.read_bytes()))
+        os.chmod(dest, 0o666)
+    for index in range(count):
+        dest = new / maildir_name(index)
+        dest.write_bytes(generated_message(index))
+        os.chmod(dest, 0o666)
+        if (index + 1) % 5000 == 0:
+            print(f"wrote {index + 1}")
+
+    print(
+        f"wrote {len(corpus)} corpus message(s) and {count} generated "
+        f"message(s) under {new}"
+    )
+
+
 def main() -> None:
     args = parse_args()
+    if args.dovecot_maildir:
+        write_dovecot_maildir(Path(args.dovecot_maildir), args.force)
+        return
+
     if not args.force and inbox_has_marker():
         print(
             f"INBOX already contains {MARKER!r}; skipping "
