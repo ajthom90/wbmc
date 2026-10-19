@@ -122,6 +122,12 @@ async fn add_imap_account_then_sync_then_read() {
     assert_eq!(rows.len(), 50);
     let content = h.core.message_content(rows[0].id.clone()).await.unwrap();
     assert!(!content.subject.is_empty());
+    // A cached body stays readable without credentials (offline, locked keychain).
+    let key = password_key(&AccountId::from(account.id.clone()));
+    h.secrets.delete(&key).unwrap();
+    let cached = h.core.message_content(rows[0].id.clone()).await.unwrap();
+    assert_eq!(cached.subject, content.subject);
+    h.secrets.set(&key, "password").unwrap();
     // The stored config never contains the password.
     let stored = h.core.inner.store.accounts().unwrap();
     assert!(!stored[0].config.to_string().contains("password\""));

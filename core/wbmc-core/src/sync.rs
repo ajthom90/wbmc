@@ -41,6 +41,11 @@ impl SyncEngine {
     }
 
     /// Return raw RFC 5322 bytes, caching the first successful fetch.
+    /// Returns the cached raw body without touching the network or credentials.
+    pub fn cached_body(&self, account: &Account, id: &MessageId) -> Result<Option<Vec<u8>>> {
+        self.bodies.get(&account.id, id)
+    }
+
     pub async fn body(
         &self,
         account: &Account,

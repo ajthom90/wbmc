@@ -523,11 +523,19 @@ impl Inner {
             Ok((message, account))
         })
         .await?;
-        let provider = self.provider(&account).await?;
-        let raw = self
-            .engine
-            .body(&account, provider.as_ref(), &message_id)
-            .await;
+        // Serve cached bodies without credentials so offline/locked-keychain reads work.
+        let inner = self.clone();
+        let (cache_account, cache_id) = (account.clone(), message_id.clone());
+        let cached = blocking(move || inner.engine.cached_body(&cache_account, &cache_id)).await?;
+        let raw = match cached {
+            Some(raw) => Ok(raw),
+            None => {
+                let provider = self.provider(&account).await?;
+                self.engine
+                    .body(&account, provider.as_ref(), &message_id)
+                    .await
+            }
+        };
         if self.events.is_removed(&account.id) {
             // The fetch may have re-created the body directory after removal.
             let inner = self.clone();
