@@ -1,6 +1,6 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -18,17 +18,21 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 
-use super::{FolderDelta, FolderSyncState, MailProvider, RemoteFolder, RemoteMessage};
+use super::{FlagUpdate, FolderDelta, FolderSyncState, MailProvider, RemoteFolder, RemoteMessage};
 use crate::mime::parse_message;
 use crate::model::{Address, FolderRole};
 use crate::{CoreError, Result};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 const SUMMARY_HEADERS: &str = "(UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE BODY.PEEK[HEADER])";
+const SUMMARY_WITH_TEXT: &str =
+    "(UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.1024>)";
 /// GreenMail answers `BODY[TEXT]<0>{n}` with no space before the literal, which
-/// `imap-proto` rejects. The partial body is read on its own connection.
+/// `imap-proto` rejects. After that fetch fails, snippets are read once on a raw connection.
 const PARTIAL_TEXT: &str = "BODY.PEEK[TEXT]<0.1024>";
-const FLAG_BATCH: usize = 200;
+const FLAG_BATCH: usize = 500;
 
 /// How the IMAP and SMTP connections are secured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,9 +82,11 @@ impl ImapProvider {
     ) -> Result<T> {
         let mut session = self.login().await?;
         let result = work(&mut session).await;
-        drain(&session);
-        let _ = session.logout().await;
-        result
+        let logged_out = logout_session(&mut session).await;
+        match result {
+            Err(err) => Err(err),
+            Ok(value) => logged_out.map(|()| value),
+        }
     }
 
     async fn login(&self) -> Result<Session<MailStream>> {
@@ -88,9 +94,9 @@ impl ImapProvider {
         let stream = self.open_stream().await?;
         let mut client = Client::new(stream);
         if security != Security::StartTls {
-            let greeting = tokio::time::timeout(CONNECT_TIMEOUT, client.read_response())
+            let greeting = tokio::time::timeout(COMMAND_TIMEOUT, client.read_response())
                 .await
-                .map_err(|_| CoreError::Network("timed out waiting for the IMAP greeting".into()))?
+                .map_err(|_| CoreError::Network("IMAP read timed out".into()))?
                 .map_err(|err| CoreError::Network(err.to_string()))?;
             if greeting.is_none() {
                 return Err(CoreError::Network(
@@ -98,10 +104,13 @@ impl ImapProvider {
                 ));
             }
         }
-        client
-            .login(&self.config.username, &self.password)
-            .await
-            .map_err(|(err, _client)| map_login(err, &self.config.username))
+        tokio::time::timeout(
+            COMMAND_TIMEOUT,
+            client.login(&self.config.username, &self.password),
+        )
+        .await
+        .map_err(|_| CoreError::Network("IMAP login timed out".into()))?
+        .map_err(|(err, _client)| map_login(err, &self.config.username))
     }
 
     async fn open_stream(&self) -> Result<MailStream> {
@@ -173,12 +182,38 @@ impl MailProvider for ImapProvider {
         state: Option<FolderSyncState>,
         page_size: u32,
     ) -> Result<FolderDelta> {
-        let config = self.config.clone();
-        let password = self.password.clone();
-        self.with_session(async |session| {
-            sync_folder(&config, &password, session, folder, state, page_size).await
-        })
-        .await
+        if page_size == 0 {
+            return Err(CoreError::InvalidInput(
+                "page_size must be greater than 0".into(),
+            ));
+        }
+        let mut session = self.login().await?;
+        let prepared = match prepare_sync(&mut session, folder, state, page_size).await {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                let _ = logout_session(&mut session).await;
+                return Err(err);
+            }
+        };
+        match fetch_page(&mut session, &prepared.plan.uids).await {
+            Ok(rows) => {
+                let delta = complete_delta(&mut session, &prepared, rows).await;
+                finish_session(&mut session, delta).await
+            }
+            Err(FetchError::TimedOut) => {
+                let _ = logout_session(&mut session).await;
+                Err(CoreError::Network("IMAP fetch timed out".into()))
+            }
+            Err(FetchError::Imap(_)) => {
+                // A partial BODY[TEXT] can poison the parser (GreenMail omits the
+                // required space). Drop this connection. The rest of this call uses
+                // a headers fetch plus one raw snippet connection.
+                drop(session);
+                let mut session = self.login().await?;
+                let delta = fallback_page(self, &mut session, folder, &prepared).await;
+                finish_session(&mut session, delta).await
+            }
+        }
     }
 
     async fn fetch_raw(&self, folder_remote_id: &str, message_remote_id: &str) -> Result<Vec<u8>> {
@@ -190,25 +225,44 @@ impl MailProvider for ImapProvider {
 }
 
 async fn list_folders(session: &mut Session<MailStream>) -> Result<Vec<RemoteFolder>> {
-    let names = session
-        .list(Some(""), Some("*"))
-        .await
-        .map_err(map_imap)?
-        .try_collect::<Vec<Name>>()
-        .await
-        .map_err(map_imap)?;
-    Ok(names.iter().map(remote_folder).collect())
+    let names = tokio::time::timeout(COMMAND_TIMEOUT, async {
+        let listed = session.list(Some(""), Some("*")).await?;
+        listed.try_collect::<Vec<Name>>().await
+    })
+    .await
+    .map_err(|_| CoreError::Network("IMAP list timed out".into()))?
+    .map_err(map_imap)?;
+    Ok(names.iter().filter_map(remote_folder).collect())
 }
 
-fn remote_folder(name: &Name) -> RemoteFolder {
-    let remote_id = name.name().to_string();
-    let (short, parent_remote_id) = split_mailbox(&remote_id, name.delimiter());
-    RemoteFolder {
-        role: folder_role(&remote_id, &short, name.attributes()),
-        name: short,
+fn remote_folder(name: &Name) -> Option<RemoteFolder> {
+    folder_from_listing(name.name(), name.delimiter(), name.attributes())
+}
+
+fn folder_from_listing(
+    raw_name: &str,
+    delimiter: Option<&str>,
+    attributes: &[NameAttribute<'_>],
+) -> Option<RemoteFolder> {
+    if mailbox_unselectable(attributes) {
+        return None;
+    }
+    let remote_id = raw_name.to_string();
+    let (short, parent_remote_id) = split_mailbox(&remote_id, delimiter);
+    Some(RemoteFolder {
+        role: folder_role(&remote_id, &short, attributes),
+        name: decode_modified_utf7(&short),
         remote_id,
         parent_remote_id,
-    }
+    })
+}
+
+fn mailbox_unselectable(attributes: &[NameAttribute<'_>]) -> bool {
+    attributes.iter().any(|attribute| match attribute {
+        NameAttribute::NoSelect => true,
+        NameAttribute::Extension(name) if name.eq_ignore_ascii_case("\\NonExistent") => true,
+        _ => false,
+    })
 }
 
 fn split_mailbox(full: &str, delimiter: Option<&str>) -> (String, Option<String>) {
@@ -224,7 +278,7 @@ fn split_mailbox(full: &str, delimiter: Option<&str>) -> (String, Option<String>
 }
 
 fn folder_role(full: &str, short: &str, attributes: &[NameAttribute<'_>]) -> FolderRole {
-    if full.eq_ignore_ascii_case("INBOX") || short.eq_ignore_ascii_case("INBOX") {
+    if full.eq_ignore_ascii_case("INBOX") {
         return FolderRole::Inbox;
     }
     if let Some(role) = role_from_attributes(attributes) {
@@ -240,9 +294,6 @@ fn role_from_attributes(attributes: &[NameAttribute<'_>]) -> Option<FolderRole> 
         NameAttribute::Trash => Some(FolderRole::Trash),
         NameAttribute::Junk => Some(FolderRole::Junk),
         NameAttribute::Archive => Some(FolderRole::Archive),
-        NameAttribute::Extension(name) if name.eq_ignore_ascii_case("\\Inbox") => {
-            Some(FolderRole::Inbox)
-        }
         _ => None,
     })
 }
@@ -258,61 +309,100 @@ fn role_from_name(name: &str) -> Option<FolderRole> {
     }
 }
 
-async fn sync_folder(
-    config: &ImapConfig,
-    password: &str,
+struct Prepared {
+    uids: Vec<u32>,
+    uid_validity: u32,
+    plan: PagePlan,
+}
+
+async fn prepare_sync(
     session: &mut Session<MailStream>,
     folder: &RemoteFolder,
     state: Option<FolderSyncState>,
     page_size: u32,
-) -> Result<FolderDelta> {
-    if page_size == 0 {
-        return Err(CoreError::InvalidInput(
-            "page_size must be greater than 0".into(),
-        ));
-    }
-    let mailbox = session.examine(&folder.remote_id).await.map_err(|err| {
-        if matches!(err, async_imap::error::Error::No(_)) {
-            CoreError::NotFound(folder.remote_id.clone())
-        } else {
-            map_imap(err)
-        }
-    })?;
+) -> Result<Prepared> {
+    let mailbox = examine(session, &folder.remote_id).await?;
     let uid_validity = mailbox.uid_validity.ok_or_else(|| {
         CoreError::Protocol(format!("mailbox {} has no UIDVALIDITY", folder.remote_id))
     })?;
-    let mut uids: Vec<u32> = session
-        .uid_search("ALL")
+    let uids = search_all(session).await?;
+    let plan = page_plan(&uids, state, uid_validity, page_size as usize)?;
+    Ok(Prepared {
+        uids,
+        uid_validity,
+        plan,
+    })
+}
+
+async fn examine(
+    session: &mut Session<MailStream>,
+    mailbox: &str,
+) -> Result<async_imap::types::Mailbox> {
+    tokio::time::timeout(COMMAND_TIMEOUT, session.examine(mailbox))
         .await
+        .map_err(|_| CoreError::Network("IMAP examine timed out".into()))?
+        .map_err(|err| map_mailbox_error(err, mailbox))
+}
+
+async fn search_all(session: &mut Session<MailStream>) -> Result<Vec<u32>> {
+    let mut uids: Vec<u32> = tokio::time::timeout(COMMAND_TIMEOUT, session.uid_search("ALL"))
+        .await
+        .map_err(|_| CoreError::Network("IMAP search timed out".into()))?
         .map_err(map_imap)?
         .into_iter()
         .collect();
     uids.sort_unstable();
+    Ok(uids)
+}
 
-    let plan = page_plan(&uids, state, uid_validity, page_size as usize)?;
-    let mut rows = fetch_summaries(session, &plan.uids).await?;
-    if plan.refresh_flags {
-        let known: Vec<u32> = uids
-            .iter()
-            .copied()
-            .filter(|uid| {
-                plan.known_lowest > 0 && (plan.known_lowest..=plan.known_highest).contains(uid)
-            })
-            .collect();
-        if !known.is_empty() {
-            let snaps = refresh_flags(session, &known).await?;
-            // New-mail upserts already carry flags. Known messages are not
-            // re-emitted: FolderSyncState has no prior flag snapshot, and an
-            // incremental sync must return only mail that is new or gone.
-            overlay_flags(&mut rows, &snaps);
-        }
-    }
-    let fetched: Vec<u32> = rows
+async fn fallback_page(
+    provider: &ImapProvider,
+    session: &mut Session<MailStream>,
+    folder: &RemoteFolder,
+    prepared: &Prepared,
+) -> Result<FolderDelta> {
+    examine(session, &folder.remote_id).await?;
+    let mut rows = fetch_headers(session, &prepared.plan.uids).await?;
+    let wanted: Vec<u32> = rows
         .iter()
         .filter_map(|row| row.message.remote_id.parse().ok())
         .collect();
-    let texts = partial_texts(config, password, &folder.remote_id, &fetched).await;
-    for row in &mut rows {
+    let texts = partial_texts(provider, &folder.remote_id, &wanted).await?;
+    apply_snippets(&mut rows, &texts);
+    complete_delta(session, prepared, rows).await
+}
+
+async fn complete_delta(
+    session: &mut Session<MailStream>,
+    prepared: &Prepared,
+    rows: Vec<SummaryRow>,
+) -> Result<FolderDelta> {
+    let flag_updates = if prepared.plan.final_incremental {
+        let known = known_uids(
+            &prepared.uids,
+            prepared.plan.known_lowest,
+            prepared.plan.known_highest,
+        );
+        refresh_flags(session, &known).await?
+    } else {
+        Vec::new()
+    };
+    Ok(assemble_delta(prepared, rows, flag_updates))
+}
+
+fn known_uids(present: &[u32], lowest: u32, highest: u32) -> Vec<u32> {
+    if lowest == 0 || highest < lowest {
+        return Vec::new();
+    }
+    present
+        .iter()
+        .copied()
+        .filter(|uid| (lowest..=highest).contains(uid))
+        .collect()
+}
+
+fn apply_snippets(rows: &mut [SummaryRow], texts: &HashMap<u32, Vec<u8>>) {
+    for row in rows {
         let Ok(uid) = row.message.remote_id.parse::<u32>() else {
             continue;
         };
@@ -321,20 +411,51 @@ async fn sync_folder(
             row.message.snippet = snippet_from(header, Some(text.as_slice()));
         }
     }
-    rows.sort_by_key(|row| std::cmp::Reverse(row.message.remote_id.parse::<u32>().unwrap_or(0)));
-    let upserts: Vec<RemoteMessage> = rows.into_iter().map(|row| row.message).collect();
+}
 
-    Ok(FolderDelta {
+fn assemble_delta(
+    prepared: &Prepared,
+    mut rows: Vec<SummaryRow>,
+    flag_updates: Vec<FlagUpdate>,
+) -> FolderDelta {
+    rows.sort_by_key(|row| std::cmp::Reverse(row.message.remote_id.parse::<u32>().unwrap_or(0)));
+    let upserts = rows.into_iter().map(|row| row.message).collect();
+    let server_remote_ids = prepared
+        .plan
+        .final_incremental
+        .then(|| prepared.uids.iter().map(ToString::to_string).collect());
+    FolderDelta {
         upserts,
-        deleted_remote_ids: plan.deleted,
+        deleted_remote_ids: Vec::new(),
+        flag_updates,
+        server_remote_ids,
         new_state: FolderSyncState::Imap {
-            uid_validity,
-            highest_uid: plan.highest_uid,
-            lowest_uid: plan.lowest_uid,
+            uid_validity: prepared.uid_validity,
+            highest_uid: prepared.plan.highest_uid,
+            lowest_uid: prepared.plan.lowest_uid,
         },
-        more: plan.more,
-        reset: plan.reset,
-    })
+        more: prepared.plan.more,
+        reset: prepared.plan.reset,
+    }
+}
+
+async fn finish_session(
+    session: &mut Session<MailStream>,
+    result: Result<FolderDelta>,
+) -> Result<FolderDelta> {
+    let logged_out = logout_session(session).await;
+    match result {
+        Err(err) => Err(err),
+        Ok(delta) => logged_out.map(|()| delta),
+    }
+}
+
+async fn logout_session(session: &mut Session<MailStream>) -> Result<()> {
+    drain(session);
+    match tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await {
+        Err(_) => Err(CoreError::Network("IMAP logout timed out".into())),
+        Ok(_) => Ok(()),
+    }
 }
 
 struct PagePlan {
@@ -344,8 +465,8 @@ struct PagePlan {
     highest_uid: u32,
     known_lowest: u32,
     known_highest: u32,
-    deleted: Vec<String>,
-    refresh_flags: bool,
+    /// Backfill is finished and this page has no further newer mail.
+    final_incremental: bool,
     reset: bool,
 }
 
@@ -381,8 +502,7 @@ fn page_plan(
             highest_uid: highest,
             known_lowest: 0,
             known_highest: 0,
-            deleted: Vec::new(),
-            refresh_flags: false,
+            final_incremental: false,
             reset,
         });
     };
@@ -421,15 +541,15 @@ fn page_plan(
         .unwrap_or(highest_uid)
         .max(highest_uid);
 
+    let more = more_older || more_newer;
     Ok(PagePlan {
         uids: fetch,
-        more: more_older || more_newer,
+        more,
         lowest_uid: lowest,
         highest_uid: highest,
         known_lowest: lowest_uid,
         known_highest: highest_uid,
-        deleted: missing_uids(uids, lowest_uid, highest_uid),
-        refresh_flags: older.is_empty(),
+        final_incremental: older.is_empty() && !more,
         reset: false,
     })
 }
@@ -442,17 +562,6 @@ fn newest_page(uids: &[u32], page_size: usize) -> (Vec<u32>, bool) {
     }
 }
 
-fn missing_uids(present: &[u32], lowest: u32, highest: u32) -> Vec<String> {
-    if lowest == 0 || highest < lowest {
-        return Vec::new();
-    }
-    let present: HashSet<u32> = present.iter().copied().collect();
-    (lowest..=highest)
-        .filter(|uid| !present.contains(uid))
-        .map(|uid| uid.to_string())
-        .collect()
-}
-
 async fn fetch_raw(
     session: &mut Session<MailStream>,
     folder_remote_id: &str,
@@ -461,13 +570,8 @@ async fn fetch_raw(
     let uid: u32 = message_remote_id.parse().map_err(|_| {
         CoreError::InvalidInput(format!("message id {message_remote_id} is not an IMAP UID"))
     })?;
-    session
-        .examine(folder_remote_id)
-        .await
-        .map_err(|err| map_mailbox_error(err, folder_remote_id))?;
-    let fetches = fetch_query(session, &uid.to_string(), "BODY.PEEK[]")
-        .await
-        .map_err(map_imap)?;
+    examine(session, folder_remote_id).await?;
+    let fetches = fetch_query(session, &uid.to_string(), "BODY.PEEK[]").await?;
     fetches
         .iter()
         .find_map(|fetch| fetch.body().map(<[u8]>::to_vec))
@@ -479,63 +583,74 @@ struct SummaryRow {
     header: Vec<u8>,
 }
 
-async fn fetch_summaries(
+enum FetchError {
+    TimedOut,
+    Imap(async_imap::error::Error),
+}
+
+async fn fetch_page(
     session: &mut Session<MailStream>,
     uids: &[u32],
-) -> Result<Vec<SummaryRow>> {
+) -> std::result::Result<Vec<SummaryRow>, FetchError> {
     if uids.is_empty() {
         return Ok(Vec::new());
     }
-    let fetches = fetch_query(session, &uid_set(uids), SUMMARY_HEADERS)
-        .await
-        .map_err(map_imap)?;
+    let fetches = fetch_query_raw(session, &uid_set(uids), SUMMARY_WITH_TEXT).await?;
     Ok(fetches.iter().filter_map(message_from_fetch).collect())
 }
 
-async fn refresh_flags(session: &mut Session<MailStream>, uids: &[u32]) -> Result<Vec<FlagSnap>> {
-    let mut snaps = Vec::new();
+async fn fetch_headers(session: &mut Session<MailStream>, uids: &[u32]) -> Result<Vec<SummaryRow>> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fetches = fetch_query(session, &uid_set(uids), SUMMARY_HEADERS).await?;
+    Ok(fetches.iter().filter_map(message_from_fetch).collect())
+}
+
+async fn refresh_flags(session: &mut Session<MailStream>, uids: &[u32]) -> Result<Vec<FlagUpdate>> {
+    let mut updates = Vec::new();
     for chunk in uids.chunks(FLAG_BATCH) {
-        let fetches = fetch_query(session, &uid_set(chunk), "(UID FLAGS)")
-            .await
-            .map_err(map_imap)?;
+        let fetches = fetch_query(session, &uid_set(chunk), "(UID FLAGS)").await?;
         for fetch in fetches {
             let Some(uid) = fetch.uid else { continue };
             let (is_read, is_flagged) = flag_state(&fetch);
-            snaps.push(FlagSnap {
-                uid,
+            updates.push(FlagUpdate {
+                remote_id: uid.to_string(),
                 is_read,
                 is_flagged,
             });
         }
     }
-    Ok(snaps)
-}
-
-struct FlagSnap {
-    uid: u32,
-    is_read: bool,
-    is_flagged: bool,
-}
-
-fn overlay_flags(rows: &mut [SummaryRow], snaps: &[FlagSnap]) {
-    for row in rows {
-        let Ok(uid) = row.message.remote_id.parse::<u32>() else {
-            continue;
-        };
-        if let Some(snap) = snaps.iter().find(|snap| snap.uid == uid) {
-            row.message.is_read = snap.is_read;
-            row.message.is_flagged = snap.is_flagged;
-        }
-    }
+    Ok(updates)
 }
 
 async fn fetch_query(
     session: &mut Session<MailStream>,
     uid_set: &str,
     query: &str,
-) -> std::result::Result<Vec<Fetch>, async_imap::error::Error> {
+) -> Result<Vec<Fetch>> {
+    match fetch_query_raw(session, uid_set, query).await {
+        Ok(fetches) => Ok(fetches),
+        Err(FetchError::TimedOut) => Err(CoreError::Network("IMAP fetch timed out".into())),
+        Err(FetchError::Imap(err)) => Err(map_imap(err)),
+    }
+}
+
+async fn fetch_query_raw(
+    session: &mut Session<MailStream>,
+    uid_set: &str,
+    query: &str,
+) -> std::result::Result<Vec<Fetch>, FetchError> {
     drain(session);
-    session.uid_fetch(uid_set, query).await?.try_collect().await
+    let pending = async {
+        let stream = session.uid_fetch(uid_set, query).await?;
+        stream.try_collect::<Vec<Fetch>>().await
+    };
+    match tokio::time::timeout(COMMAND_TIMEOUT, pending).await {
+        Ok(Ok(fetches)) => Ok(fetches),
+        Ok(Err(err)) => Err(FetchError::Imap(err)),
+        Err(_) => Err(FetchError::TimedOut),
+    }
 }
 
 fn message_from_fetch(fetch: &Fetch) -> Option<SummaryRow> {
@@ -556,7 +671,7 @@ fn message_from_fetch(fetch: &Fetch) -> Option<SummaryRow> {
             to: convert_list(envelope.and_then(|value| value.to.as_ref())),
             cc: convert_list(envelope.and_then(|value| value.cc.as_ref())),
             date_ms: date_ms(fetch),
-            snippet: String::new(),
+            snippet: snippet_from(fetch.header(), fetch.text()),
             is_read,
             is_flagged,
             has_attachments: fetch.bodystructure().is_some_and(has_attachments),
@@ -614,9 +729,6 @@ fn snippet_from(header: Option<&[u8]>, text: Option<&[u8]>) -> String {
     let Some(text) = text.filter(|text| !text.is_empty()) else {
         return String::new();
     };
-    if looks_like_mime_structure(text) {
-        return String::new();
-    }
     let mut raw = Vec::with_capacity(header.map_or(0, <[u8]>::len) + text.len() + 4);
     if let Some(header) = header {
         raw.extend_from_slice(header);
@@ -631,23 +743,6 @@ fn snippet_from(header: Option<&[u8]>, text: Option<&[u8]>) -> String {
     }
     raw.extend_from_slice(text);
     parse_message(&raw, 0).snippet
-}
-
-fn looks_like_mime_structure(text: &[u8]) -> bool {
-    let start = trim_ascii_start(text);
-    if start.is_empty() {
-        return false;
-    }
-    let head = &start[..start.len().min(1024)];
-    let lower = String::from_utf8_lossy(head).to_ascii_lowercase();
-    let trimmed = lower.trim();
-    trimmed.starts_with("--")
-        || trimmed.starts_with("content-type:")
-        || trimmed.starts_with("content-transfer-encoding:")
-        || trimmed.starts_with("mime-version:")
-        || trimmed.starts_with("this is a multi-part message")
-        || trimmed.starts_with("this is a multipart message")
-        || (trimmed.contains("\ncontent-type:") && trimmed.contains("\n--"))
 }
 
 fn has_attachments(structure: &BodyStructure<'_>) -> bool {
@@ -779,42 +874,21 @@ fn format_range(start: u32, end: u32) -> String {
 }
 
 async fn partial_texts(
-    config: &ImapConfig,
-    password: &str,
-    mailbox: &str,
-    uids: &[u32],
-) -> HashMap<u32, Vec<u8>> {
-    if uids.is_empty() {
-        return HashMap::new();
-    }
-    partial_texts_inner(config, password, mailbox, uids)
-        .await
-        .unwrap_or_default()
-}
-
-async fn partial_texts_inner(
-    config: &ImapConfig,
-    password: &str,
+    provider: &ImapProvider,
     mailbox: &str,
     uids: &[u32],
 ) -> Result<HashMap<u32, Vec<u8>>> {
-    let provider = ImapProvider {
-        config: config.clone(),
-        password: password.to_string(),
-    };
+    if uids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let user = quote_imap(&provider.config.username)?;
+    let password = quote_imap(&provider.password)?;
+    let mailbox = quote_imap(mailbox)?;
     let mut stream = provider.open_stream().await?;
-    if config.security != Security::StartTls {
+    if provider.config.security != Security::StartTls {
         let _greeting = read_line(&mut stream).await?;
     }
-    write_cmd(
-        &mut stream,
-        &format!(
-            "A001 LOGIN {} {}",
-            quote_imap(&config.username),
-            quote_imap(password)
-        ),
-    )
-    .await?;
+    write_cmd(&mut stream, &format!("A001 LOGIN {user} {password}")).await?;
     let login = read_tagged(&mut stream, b"A001").await?;
     if !tagged_ok(&login, b"A001") {
         return Err(CoreError::Protocol(format!(
@@ -822,11 +896,7 @@ async fn partial_texts_inner(
             String::from_utf8_lossy(&login).trim()
         )));
     }
-    write_cmd(
-        &mut stream,
-        &format!("A002 EXAMINE {}", quote_imap(mailbox)),
-    )
-    .await?;
+    write_cmd(&mut stream, &format!("A002 EXAMINE {mailbox}")).await?;
     let examined = read_tagged(&mut stream, b"A002").await?;
     if !tagged_ok(&examined, b"A002") {
         return Err(CoreError::Protocol(format!(
@@ -846,8 +916,16 @@ async fn partial_texts_inner(
         .await?;
         texts.extend(read_partial_bodies(&mut stream, tag.as_bytes()).await?);
     }
-    let _ = write_cmd(&mut stream, "A003 LOGOUT").await;
+    raw_logout(&mut stream).await?;
     Ok(texts)
+}
+
+async fn raw_logout(stream: &mut MailStream) -> Result<()> {
+    write_cmd(stream, "A003 LOGOUT").await?;
+    tokio::time::timeout(LOGOUT_TIMEOUT, read_tagged(stream, b"A003"))
+        .await
+        .map_err(|_| CoreError::Network("IMAP logout timed out".into()))??;
+    Ok(())
 }
 
 async fn read_partial_bodies(stream: &mut MailStream, tag: &[u8]) -> Result<HashMap<u32, Vec<u8>>> {
@@ -884,9 +962,9 @@ async fn read_partial_bodies(stream: &mut MailStream, tag: &[u8]) -> Result<Hash
                 ));
             }
             let mut body = vec![0u8; len];
-            tokio::time::timeout(CONNECT_TIMEOUT, stream.read_exact(&mut body))
+            tokio::time::timeout(COMMAND_TIMEOUT, stream.read_exact(&mut body))
                 .await
-                .map_err(|_| CoreError::Network("timed out reading an IMAP literal".into()))?
+                .map_err(|_| CoreError::Network("IMAP read timed out".into()))?
                 .map_err(|err| CoreError::Network(err.to_string()))?;
             if text_section {
                 match current_uid {
@@ -933,8 +1011,97 @@ fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     })
 }
 
-fn quote_imap(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+fn quote_imap(value: &str) -> Result<String> {
+    if value.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        return Err(CoreError::InvalidInput(
+            "IMAP quoted string contains CR, LF, or NUL".into(),
+        ));
+    }
+    Ok(format!(
+        "\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+fn decode_modified_utf7(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'&' {
+            let ch = input[index..].chars().next().unwrap_or('\u{FFFD}');
+            out.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+        let encoded_at = index + 1;
+        if encoded_at >= bytes.len() {
+            out.push('&');
+            break;
+        }
+        if bytes[encoded_at] == b'-' {
+            out.push('&');
+            index = encoded_at + 1;
+            continue;
+        }
+        let end = bytes[encoded_at..]
+            .iter()
+            .position(|byte| *byte == b'-')
+            .map(|offset| encoded_at + offset);
+        let (encoded, next) = match end {
+            Some(end) => (&input[encoded_at..end], end + 1),
+            None => (&input[encoded_at..], bytes.len()),
+        };
+        match decode_modified_base64(encoded) {
+            Some(raw) => out.push_str(&utf16be_lossy(&raw)),
+            None => {
+                out.push('&');
+                out.push_str(encoded);
+                if end.is_some() {
+                    out.push('-');
+                }
+            }
+        }
+        index = next;
+    }
+    out
+}
+
+fn decode_modified_base64(input: &str) -> Option<Vec<u8>> {
+    if input.is_empty() {
+        return None;
+    }
+    let mut bits = 0u32;
+    let mut bit_count = 0u32;
+    let mut out = Vec::new();
+    for ch in input.chars() {
+        let value = match ch {
+            'A'..='Z' => ch as u32 - 'A' as u32,
+            'a'..='z' => ch as u32 - 'a' as u32 + 26,
+            '0'..='9' => ch as u32 - '0' as u32 + 52,
+            '+' => 62,
+            ',' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6) | value;
+        bit_count += 6;
+        if bit_count >= 8 {
+            bit_count -= 8;
+            out.push((bits >> bit_count) as u8);
+            bits &= (1 << bit_count) - 1;
+        }
+    }
+    Some(out)
+}
+
+fn utf16be_lossy(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_be_bytes(*chunk))
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 fn map_mailbox_error(err: async_imap::error::Error, mailbox: &str) -> CoreError {
@@ -1015,9 +1182,9 @@ async fn read_line(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        let read = tokio::time::timeout(CONNECT_TIMEOUT, stream.read(&mut byte))
+        let read = tokio::time::timeout(COMMAND_TIMEOUT, stream.read(&mut byte))
             .await
-            .map_err(|_| CoreError::Network("timed out reading IMAP".into()))?
+            .map_err(|_| CoreError::Network("IMAP read timed out".into()))?
             .map_err(|err| CoreError::Network(err.to_string()))?;
         if read == 0 {
             return Err(CoreError::Network(
@@ -1110,5 +1277,154 @@ impl AsyncWrite for MailStream {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
             Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use async_imap::imap_proto::NameAttribute;
+
+    use super::{
+        decode_modified_utf7, folder_from_listing, literal_len, page_plan, quote_imap,
+        snippet_from, uid_set,
+    };
+    use crate::CoreError;
+    use crate::model::FolderRole;
+    use crate::provider::FolderSyncState;
+
+    fn imap_state(uid_validity: u32, lowest_uid: u32, highest_uid: u32) -> FolderSyncState {
+        FolderSyncState::Imap {
+            uid_validity,
+            lowest_uid,
+            highest_uid,
+        }
+    }
+
+    #[test]
+    fn multipart_partial_yields_snippet() {
+        let header = b"From: Alice <alice@wbmc.test>\r\n\
+            Subject: Report\r\n\
+            MIME-Version: 1.0\r\n\
+            Content-Type: multipart/alternative; boundary=\"alt\"\r\n\
+            \r\n";
+        let partial = b"--alt\r\n\
+            Content-Type: text/plain; charset=utf-8\r\n\
+            \r\n\
+            This text survives truncation.\r\n\
+            --alt\r\n\
+            Content-Type: text/html; charset=utf-8\r\n\
+            \r\n\
+            <html><body><p>cut off";
+        let snippet = snippet_from(Some(header), Some(partial));
+        assert!(
+            snippet.contains("This text survives truncation"),
+            "{snippet}"
+        );
+    }
+
+    #[test]
+    fn quote_imap_rejects_cr_lf_nul() {
+        for value in ["a\rb", "a\nb", "a\0b", "\r\n"] {
+            assert!(
+                matches!(quote_imap(value), Err(CoreError::InvalidInput(_))),
+                "{value:?}"
+            );
+        }
+        assert_eq!(quote_imap("alice").unwrap(), "\"alice\"");
+        assert_eq!(quote_imap("a\"b\\c").unwrap(), "\"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn modified_utf7_decodes_mailbox_name() {
+        let folder = folder_from_listing("Entw&APw-rfe", None, &[]).expect("folder");
+        assert_eq!(folder.remote_id, "Entw&APw-rfe");
+        assert_eq!(folder.name, "Entwürfe");
+        assert_eq!(decode_modified_utf7("a&-b"), "a&b");
+    }
+
+    #[test]
+    fn archive_inbox_is_not_inbox() {
+        let nested = folder_from_listing("Archive/INBOX", Some("/"), &[]).expect("nested");
+        assert_eq!(nested.remote_id, "Archive/INBOX");
+        assert_eq!(nested.name, "INBOX");
+        assert_eq!(nested.parent_remote_id.as_deref(), Some("Archive"));
+        assert_ne!(nested.role, FolderRole::Inbox);
+
+        let inbox = folder_from_listing("inbox", None, &[]).expect("inbox");
+        assert_eq!(inbox.role, FolderRole::Inbox);
+    }
+
+    #[test]
+    fn unselectable_mailboxes_are_skipped() {
+        assert!(folder_from_listing("INBOX", None, &[NameAttribute::NoSelect]).is_none());
+        assert!(
+            folder_from_listing(
+                "gone",
+                None,
+                &[NameAttribute::Extension(Cow::Borrowed("\\NonExistent"))]
+            )
+            .is_none()
+        );
+        assert!(folder_from_listing("INBOX", None, &[NameAttribute::NoInferiors]).is_some());
+    }
+
+    #[test]
+    fn page_plan_uidvalidity_reset() {
+        let plan = page_plan(&[1, 2, 3, 4, 5], Some(imap_state(1, 3, 9)), 2, 2).unwrap();
+        assert!(plan.reset);
+        assert!(!plan.final_incremental);
+        assert!(plan.more);
+        assert_eq!(plan.uids, vec![4, 5]);
+        assert_eq!(plan.lowest_uid, 4);
+        assert_eq!(plan.highest_uid, 5);
+    }
+
+    #[test]
+    fn page_plan_mixes_older_and_newer() {
+        let plan = page_plan(
+            &[1, 2, 3, 4, 5, 10, 11, 12],
+            Some(imap_state(7, 4, 5)),
+            7,
+            2,
+        )
+        .unwrap();
+        assert!(!plan.reset);
+        assert!(!plan.final_incremental);
+        assert!(plan.more);
+        assert_eq!(plan.uids, vec![2, 3, 10, 11]);
+        assert_eq!(plan.lowest_uid, 2);
+        assert_eq!(plan.highest_uid, 11);
+    }
+
+    #[test]
+    fn page_plan_final_incremental_page() {
+        let plan = page_plan(&[1, 2, 3, 4, 5, 9], Some(imap_state(7, 1, 5)), 7, 10).unwrap();
+        assert!(plan.final_incremental);
+        assert!(!plan.more);
+        assert!(!plan.reset);
+        assert_eq!(plan.uids, vec![9]);
+
+        let finishing_backfill =
+            page_plan(&[1, 2, 3, 4, 5], Some(imap_state(7, 3, 5)), 7, 10).unwrap();
+        assert!(!finishing_backfill.final_incremental);
+        assert!(!finishing_backfill.more);
+        assert_eq!(finishing_backfill.uids, vec![1, 2]);
+    }
+
+    #[test]
+    fn uid_set_collapses_ranges() {
+        assert_eq!(uid_set(&[]), "");
+        assert_eq!(uid_set(&[3, 1, 2, 2]), "1:3");
+        assert_eq!(uid_set(&[1, 2, 4, 7, 8]), "1:2,4,7:8");
+    }
+
+    #[test]
+    fn literal_len_reads_both_literal_forms() {
+        assert_eq!(literal_len(b"* 1 FETCH (BODY[TEXT]<0>{15}\r\n"), Some(15));
+        assert_eq!(literal_len(b"* 1 FETCH (BODY[TEXT]<0> {15}\r\n"), Some(15));
+        assert_eq!(literal_len(b"* OK done\r\n"), None);
+        assert_eq!(literal_len(b"* 1 FETCH (BODY[TEXT]<0>{15}"), None);
     }
 }

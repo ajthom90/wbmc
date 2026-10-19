@@ -53,14 +53,27 @@ pub enum FolderSyncState {
     },
 }
 
+/// Read and flagged state for a message the client already has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagUpdate {
+    pub remote_id: String,
+    pub is_read: bool,
+    pub is_flagged: bool,
+}
+
 /// One page of remote changes.
 ///
 /// `reset` means the local cache for the folder must be cleared before applying
-/// `upserts` and `deleted_remote_ids`. `more` means older messages remain.
+/// `upserts`. `more` means another page remains. `deleted_remote_ids` is filled
+/// by providers that name removals themselves (Graph). IMAP leaves it empty and
+/// instead sets `server_remote_ids` to every UID still on the server, on the
+/// final page of an incremental pass. `flag_updates` is filled on that same page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderDelta {
     pub upserts: Vec<RemoteMessage>,
     pub deleted_remote_ids: Vec<String>,
+    pub flag_updates: Vec<FlagUpdate>,
+    pub server_remote_ids: Option<Vec<String>>,
     pub new_state: FolderSyncState,
     pub more: bool,
     pub reset: bool,

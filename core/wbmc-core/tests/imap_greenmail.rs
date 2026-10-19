@@ -185,11 +185,15 @@ async fn first_page_is_newest() {
         .max_by_key(|message| message.date_ms)
         .expect("page");
     assert_eq!(newest.subject, "Seed message 0499");
+    // GreenMail omits the SP before a partial literal, so this snippet is only
+    // present when the raw-connection fallback parsed BODY[TEXT]<0>{n}.
     assert!(
         newest.snippet.contains("Seed body 0499"),
         "snippet was {:?}",
         newest.snippet
     );
+    assert!(delta.flag_updates.is_empty());
+    assert!(delta.server_remote_ids.is_none());
 }
 
 #[tokio::test]
@@ -338,11 +342,82 @@ async fn detects_deletion() {
         .sync_folder(&folder, state, 10)
         .await
         .expect("sync after delete");
+    assert!(delta.deleted_remote_ids.is_empty());
+    let present = delta
+        .server_remote_ids
+        .expect("final incremental page lists server uids");
     assert!(
-        delta.deleted_remote_ids.iter().any(|id| id == &target),
-        "deleted uid {target} missing from {:?}",
-        delta.deleted_remote_ids
+        !present.iter().any(|id| id == &target),
+        "deleted uid {target} still in {present:?}"
     );
+    for message in synced.iter().filter(|message| message.remote_id != target) {
+        assert!(
+            present.iter().any(|id| id == &message.remote_id),
+            "kept uid {} missing from {present:?}",
+            message.remote_id
+        );
+    }
+}
+
+#[tokio::test]
+async fn incremental_reports_flag_updates() {
+    if !imap_tests_enabled() {
+        return;
+    }
+    let mailbox = unique_mailbox();
+    let mut session = connect_session().await;
+    session.create(&mailbox).await.expect("create");
+    for index in 0..2 {
+        session
+            .append(
+                &mailbox,
+                None,
+                None,
+                rfc822(&format!("flag {index}"), index),
+            )
+            .await
+            .expect("append");
+    }
+    let _ = session.logout().await;
+
+    let provider = ready_provider().await;
+    let folder = RemoteFolder {
+        remote_id: mailbox.clone(),
+        name: mailbox.clone(),
+        role: FolderRole::Other,
+        parent_remote_id: None,
+    };
+    let state = backfill(&provider, &folder, 10).await;
+
+    let mut session = connect_session().await;
+    session.select(&mailbox).await.expect("select");
+    let uids: Vec<u32> = session
+        .uid_search("ALL")
+        .await
+        .expect("search")
+        .into_iter()
+        .collect();
+    let target = uids[0].to_string();
+    session
+        .uid_store(&target, "+FLAGS (\\Seen)")
+        .await
+        .expect("uid store")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("store response");
+    let _ = session.logout().await;
+
+    let delta = provider
+        .sync_folder(&folder, Some(state), 10)
+        .await
+        .expect("incremental");
+    assert!(!delta.more);
+    let update = delta
+        .flag_updates
+        .iter()
+        .find(|update| update.remote_id == target)
+        .expect("flag update");
+    assert!(update.is_read);
 }
 
 #[tokio::test]
