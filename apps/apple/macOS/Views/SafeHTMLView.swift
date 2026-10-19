@@ -153,7 +153,7 @@ struct SafeHTMLView: NSViewRepresentable {
 }
 
 /// A forward-only UTF-8 tag scan. Each tag/attribute is scanned a bounded number
-/// of times; quoted '>' characters, comments and raw-text elements stay intact.
+/// of times; quoted '>' characters and non-resource raw text stay intact.
 private struct MailHTMLScanner {
     private let bytes: [UInt8]
 
@@ -171,29 +171,32 @@ private struct MailHTMLScanner {
     private static let bangCommentClose = Array("--!>".utf8)
     private static let doctypeStart = Array("<!doctype".utf8)
     private static let rawTextClosers = Dictionary(uniqueKeysWithValues:
-        ["script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes", "plaintext"].map {
+        ["script", "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes", "plaintext", "noscript"].map {
             ($0, Array(("</" + $0).utf8))
         })
+    private static let rawResourceStarts = ["<link", "<meta", "<base"].map { Array($0.utf8) }
 
     mutating func securedHTML(metadata: String) -> String {
         var output: [UInt8] = []
         output.reserveCapacity(bytes.count + metadata.utf8.count)
-        // Install policy before any untrusted bytes, independently of how
-        // WebKit tokenizes malformed mail or handles later html/head tags.
+        // Only optional whitespace and one complete leading doctype may
+        // precede policy. No element or comment is placed before the metadata.
+        let prefixEnd = leadingDoctypeEnd() ?? 0
+        output.append(contentsOf: bytes[..<prefixEnd])
         output.append(contentsOf: metadata.utf8)
-        var rawText: (name: String, close: [UInt8])?
-        var index = 0
-        var copiedThrough = 0
+        var rawText: (name: String, end: Int)?
+        var index = prefixEnd
+        var copiedThrough = prefixEnd
         while index < bytes.count {
             guard bytes[index] == 60 else { // <
                 index += 1
                 continue
             }
             if let raw = rawText {
-                // Close-tag bytes are precomputed once, never per raw-text '<'.
-                guard matches(raw.close, at: index, ignoringCase: true),
-                      index + raw.close.count < bytes.count,
-                      isDelimiter(bytes[index + raw.close.count]) else { index += 1; continue }
+                // Foreign content may treat these as live elements even when
+                // our HTML raw-text heuristic is active. Do not interpret
+                // comments, declarations or other opening tags in this mode.
+                guard index == raw.end || isRawResourceStart(at: index) else { index += 1; continue }
             } else {
                 if matches(Self.commentStart, at: index) {
                     guard let end = commentEnd(at: index) else { break }
@@ -218,7 +221,15 @@ private struct MailHTMLScanner {
                     continue
                 }
             }
-            guard let tag = tag(at: index) else {
+            let tagLimit = rawText.map { index < $0.end ? $0.end : bytes.count } ?? bytes.count
+            guard let tag = tag(at: index, before: tagLimit) else {
+                if let raw = rawText {
+                    // Preserve incomplete tag-like raw text, and resume at
+                    // its closing tag. Skipping this already-scanned range
+                    // prevents repeated scans of the same unterminated value.
+                    if index < raw.end { index = raw.end; continue }
+                    break
+                }
                 // HTML does not emit a real tag left incomplete at EOF. Drop it
                 // rather than leaving an unscanned suffix in the secured output.
                 output.append(contentsOf: bytes[copiedThrough..<index])
@@ -226,13 +237,18 @@ private struct MailHTMLScanner {
                 break
             }
             let attributes = (tag.name == "link" || tag.name == "meta") ? attributes(of: tag) : [:]
+            let hasMalformedAttributeName = attributes.keys.contains { name in
+                name.utf8.contains { $0 == 61 || $0 == 34 || $0 == 39 || $0 == 60 }
+            }
             let remove: Bool
             if !tag.closing, tag.name == "link" {
                 let href = (attributes["href"] ?? "").drop(while: { $0.isWhitespace }).lowercased()
-                remove = !href.hasPrefix("data:")
+                remove = hasMalformedAttributeName || !href.hasPrefix("data:")
             } else if !tag.closing, tag.name == "meta" {
                 let directive = attributes["http-equiv"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                let hasDirectiveLikeName = attributes.keys.contains { $0.contains("http-equiv") }
                 remove = directive == "x-dns-prefetch-control" || directive == "refresh"
+                    || (hasMalformedAttributeName && hasDirectiveLikeName)
             } else if !tag.closing, tag.name == "base" {
                 remove = true
             } else {
@@ -242,15 +258,46 @@ private struct MailHTMLScanner {
                 output.append(contentsOf: bytes[copiedThrough..<index])
                 copiedThrough = tag.end
             }
-            if tag.closing, tag.name == rawText?.name {
-                rawText = nil
+            if let raw = rawText {
+                // Filtering a link/meta/base must never enter another raw mode.
+                if index == raw.end && tag.closing && tag.name == raw.name { rawText = nil }
             } else if !tag.closing, let close = Self.rawTextClosers[tag.name] {
-                rawText = (tag.name, close)
+                rawText = (tag.name, rawTextEnd(from: tag.end, close: close))
             }
             index = tag.end
         }
         output.append(contentsOf: bytes[copiedThrough...])
         return String(decoding: output, as: UTF8.self)
+    }
+
+    private func leadingDoctypeEnd() -> Int? {
+        var index = 0
+        while index < bytes.count && isSpace(bytes[index]) { index += 1 }
+        guard matches(Self.doctypeStart, at: index, ignoringCase: true) else { return nil }
+        let afterName = index + Self.doctypeStart.count
+        guard afterName < bytes.count, isSpace(bytes[afterName]) || bytes[afterName] == 62 else { return nil }
+        return declarationEnd(at: afterName)
+    }
+
+    private func isRawResourceStart(at index: Int) -> Bool {
+        guard isTagStart(at: index) else { return false }
+        return Self.rawResourceStarts.contains { prefix in
+            guard matches(prefix, at: index, ignoringCase: true) else { return false }
+            let afterName = index + prefix.count
+            return afterName == bytes.count || isDelimiter(bytes[afterName])
+        }
+    }
+
+    private func rawTextEnd(from start: Int, close: [UInt8]) -> Int {
+        var index = start
+        while index < bytes.count {
+            if bytes[index] == 60, matches(close, at: index, ignoringCase: true),
+               index + close.count < bytes.count, isDelimiter(bytes[index + close.count]) {
+                return index
+            }
+            index += 1
+        }
+        return bytes.count
     }
 
     private func isASCIILetter(_ byte: UInt8) -> Bool {
@@ -290,15 +337,15 @@ private struct MailHTMLScanner {
         case beforeName, name, afterName, beforeValue, quoted(UInt8), unquoted
     }
 
-    private func tag(at start: Int) -> Tag? {
-        guard isTagStart(at: start) else { return nil }
+    private func tag(at start: Int, before limit: Int) -> Tag? {
+        guard start + 1 < limit, isTagStart(at: start) else { return nil }
         let closing = bytes[start + 1] == 47
         let nameStart = start + (closing ? 2 : 1)
         var nameEnd = nameStart
-        while nameEnd < bytes.count && !isDelimiter(bytes[nameEnd]) { nameEnd += 1 }
+        while nameEnd < limit && !isDelimiter(bytes[nameEnd]) { nameEnd += 1 }
         var end = nameEnd
         var state = AttributeState.beforeName
-        while end < bytes.count {
+        while end < limit {
             let byte = bytes[end]
             // Only attribute values recognize quotes. Quotes or '=' in a tag
             // name/attribute name cannot swallow the next real tag.
@@ -339,10 +386,17 @@ private struct MailHTMLScanner {
         let end = tag.end - 1
         while index < end {
             while index < end && (isSpace(bytes[index]) || bytes[index] == 47) { index += 1 }
+            guard index < end else { break }
             let nameStart = index
-            while index < end && !isSpace(bytes[index]) && bytes[index] != 61 && bytes[index] != 47 { index += 1 }
-            guard index > nameStart else { index += 1; continue }
-            let name = String(decoding: bytes[nameStart..<index], as: UTF8.self).lowercased()
+            // In before-attribute-name, even '=' starts a name. Only later
+            // equals signs terminate that name and introduce its value.
+            index += 1
+            while index < end && !isDelimiter(bytes[index]) && bytes[index] != 61 { index += 1 }
+            let nameBytes = bytes[nameStart..<index].map { byte in
+                byte >= 65 && byte <= 90 ? byte + 32 : byte
+            }
+            let name = String(decoding: nameBytes, as: UTF8.self)
+                .replacingOccurrences(of: "\0", with: "\u{FFFD}")
             while index < end && isSpace(bytes[index]) { index += 1 }
             var value = ""
             if index < end && bytes[index] == 61 { // =
@@ -361,8 +415,11 @@ private struct MailHTMLScanner {
                     value = Self.decodeAttribute(bytes[valueStart..<index])
                 }
             }
-            // HTML uses the first occurrence of a duplicated attribute.
-            if result[name] == nil { result[name] = value }
+            // Consume every duplicate's value, but retain only the first
+            // attribute (including an empty/boolean value), as HTML does.
+            if result[name] == nil {
+                result[name] = value.replacingOccurrences(of: "\0", with: "\u{FFFD}")
+            }
         }
         return result
     }
