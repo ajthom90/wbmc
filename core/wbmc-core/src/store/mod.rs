@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::de::DeserializeOwned;
 
 use crate::model::{
@@ -28,6 +28,13 @@ date_ms, snippet, is_read, is_flagged, has_attachments";
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// Ids written and removed while applying one sync page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageApplied {
+    pub stored_ids: Vec<MessageId>,
+    pub removed_ids: Vec<MessageId>,
 }
 
 impl Store {
@@ -136,95 +143,64 @@ impl Store {
     }
 
     pub fn set_folder_sync_state(&self, folder_id: &FolderId, state: &str) -> Result<()> {
+        self.in_transaction(|tx| set_folder_sync_state_tx(tx, folder_id, Some(state)))
+    }
+
+    pub fn upsert_messages(&self, msgs: &[MessageSummary]) -> Result<Vec<MessageId>> {
+        self.in_transaction(|tx| upsert_messages_tx(tx, msgs))
+    }
+
+    pub fn delete_messages(
+        &self,
+        folder: &FolderId,
+        remote_ids: &[String],
+    ) -> Result<Vec<MessageId>> {
+        self.in_transaction(|tx| delete_messages_tx(tx, folder, remote_ids))
+    }
+
+    pub fn clear_folder(&self, folder: &FolderId) -> Result<Vec<MessageId>> {
+        self.in_transaction(|tx| clear_folder_tx(tx, folder))
+    }
+
+    pub fn apply_sync_page(
+        &self,
+        folder: &FolderId,
+        upserts: &[MessageSummary],
+        deleted_remote_ids: &[String],
+        sync_state: &str,
+    ) -> Result<PageApplied> {
+        self.in_transaction(|tx| {
+            let stored_ids = upsert_messages_tx(tx, upserts)?;
+            let removed_ids = delete_messages_tx(tx, folder, deleted_remote_ids)?;
+            set_folder_sync_state_tx(tx, folder, Some(sync_state))?;
+            recount_tx(tx, folder)?;
+            Ok(PageApplied {
+                stored_ids,
+                removed_ids,
+            })
+        })
+    }
+
+    pub fn reset_folder(&self, folder: &FolderId) -> Result<Vec<MessageId>> {
+        self.in_transaction(|tx| {
+            let removed_ids = clear_folder_tx(tx, folder)?;
+            set_folder_sync_state_tx(tx, folder, None)?;
+            recount_tx(tx, folder)?;
+            Ok(removed_ids)
+        })
+    }
+
+    pub fn message_id_for_remote(
+        &self,
+        folder: &FolderId,
+        remote_id: &str,
+    ) -> Result<Option<MessageId>> {
         let conn = self.lock()?;
-        let changed = conn.execute(
-            "UPDATE folders SET sync_state = ?2 WHERE id = ?1",
-            params![folder_id.as_str(), state],
-        )?;
-        if changed == 0 {
-            return Err(CoreError::NotFound(format!(
-                "folder {}",
-                folder_id.as_str()
-            )));
-        }
-        Ok(())
-    }
-
-    pub fn upsert_messages(&self, messages: &[MessageSummary]) -> Result<()> {
-        if messages.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO messages (
-                    id, account_id, folder_id, remote_id, subject,
-                    from_json, to_json, cc_json, date_ms, snippet,
-                    is_read, is_flagged, has_attachments
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                 ON CONFLICT(folder_id, remote_id) DO UPDATE SET
-                    -- `id` stays put: body files and UI selection key on MessageId.
-                    account_id = excluded.account_id,
-                    subject = excluded.subject,
-                    from_json = excluded.from_json,
-                    to_json = excluded.to_json,
-                    cc_json = excluded.cc_json,
-                    date_ms = excluded.date_ms,
-                    snippet = excluded.snippet,
-                    is_read = excluded.is_read,
-                    is_flagged = excluded.is_flagged,
-                    has_attachments = excluded.has_attachments",
-            )?;
-            for message in messages {
-                let from_json = json_text(&message.from)?;
-                let to_json = json_text(&message.to)?;
-                let cc_json = json_text(&message.cc)?;
-                stmt.execute(params![
-                    message.id.as_str(),
-                    message.account_id.as_str(),
-                    message.folder_id.as_str(),
-                    message.remote_id,
-                    message.subject,
-                    from_json,
-                    to_json,
-                    cc_json,
-                    message.date_ms,
-                    message.snippet,
-                    message.is_read,
-                    message.is_flagged,
-                    message.has_attachments,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn delete_messages(&self, folder_id: &FolderId, remote_ids: &[String]) -> Result<()> {
-        if remote_ids.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        {
-            let mut stmt =
-                tx.prepare("DELETE FROM messages WHERE folder_id = ?1 AND remote_id = ?2")?;
-            for remote_id in remote_ids {
-                stmt.execute(params![folder_id.as_str(), remote_id])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn clear_folder(&self, folder_id: &FolderId) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "DELETE FROM messages WHERE folder_id = ?1",
-            [folder_id.as_str()],
-        )?;
-        Ok(())
+        optional_message_id(conn.query_row(
+            "SELECT id FROM messages WHERE folder_id = ?1 AND remote_id = ?2",
+            params![folder.as_str(), remote_id],
+            |row| row.get(0),
+        ))
     }
 
     pub fn messages(
@@ -260,23 +236,7 @@ impl Store {
     }
 
     pub fn recount(&self, folder_id: &FolderId) -> Result<()> {
-        let conn = self.lock()?;
-        let changed = conn.execute(
-            "UPDATE folders SET
-                total_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1),
-                unread_count = (
-                    SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND is_read = 0
-                )
-             WHERE id = ?1",
-            [folder_id.as_str()],
-        )?;
-        if changed == 0 {
-            return Err(CoreError::NotFound(format!(
-                "folder {}",
-                folder_id.as_str()
-            )));
-        }
-        Ok(())
+        self.in_transaction(|tx| recount_tx(tx, folder_id))
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
@@ -284,6 +244,138 @@ impl Store {
             .lock()
             .map_err(|err| CoreError::Storage(format!("store lock poisoned: {err}")))
     }
+
+    fn in_transaction<T>(&self, body: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let value = body(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+}
+
+fn upsert_messages_tx(tx: &Transaction<'_>, msgs: &[MessageSummary]) -> Result<Vec<MessageId>> {
+    if msgs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = tx.prepare(
+        "INSERT INTO messages (
+            id, account_id, folder_id, remote_id, subject,
+            from_json, to_json, cc_json, date_ms, snippet,
+            is_read, is_flagged, has_attachments
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(folder_id, remote_id) DO UPDATE SET
+            -- `id` stays put: body files and UI selection key on MessageId.
+            account_id = excluded.account_id,
+            subject = excluded.subject,
+            from_json = excluded.from_json,
+            to_json = excluded.to_json,
+            cc_json = excluded.cc_json,
+            date_ms = excluded.date_ms,
+            snippet = excluded.snippet,
+            is_read = excluded.is_read,
+            is_flagged = excluded.is_flagged,
+            has_attachments = excluded.has_attachments
+         RETURNING id",
+    )?;
+    let mut stored_ids = Vec::with_capacity(msgs.len());
+    for message in msgs {
+        let from_json = json_text(&message.from)?;
+        let to_json = json_text(&message.to)?;
+        let cc_json = json_text(&message.cc)?;
+        let id: String = stmt.query_row(
+            params![
+                message.id.as_str(),
+                message.account_id.as_str(),
+                message.folder_id.as_str(),
+                message.remote_id,
+                message.subject,
+                from_json,
+                to_json,
+                cc_json,
+                message.date_ms,
+                message.snippet,
+                message.is_read,
+                message.is_flagged,
+                message.has_attachments,
+            ],
+            |row| row.get(0),
+        )?;
+        stored_ids.push(MessageId::from(id));
+    }
+    Ok(stored_ids)
+}
+
+fn delete_messages_tx(
+    tx: &Transaction<'_>,
+    folder: &FolderId,
+    remote_ids: &[String],
+) -> Result<Vec<MessageId>> {
+    if remote_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt =
+        tx.prepare("DELETE FROM messages WHERE folder_id = ?1 AND remote_id = ?2 RETURNING id")?;
+    let mut removed_ids = Vec::new();
+    for remote_id in remote_ids {
+        if let Some(id) = optional_message_id(
+            stmt.query_row(params![folder.as_str(), remote_id], |row| row.get(0)),
+        )? {
+            removed_ids.push(id);
+        }
+    }
+    Ok(removed_ids)
+}
+
+fn clear_folder_tx(tx: &Transaction<'_>, folder: &FolderId) -> Result<Vec<MessageId>> {
+    let mut stmt = tx.prepare("DELETE FROM messages WHERE folder_id = ?1 RETURNING id")?;
+    let rows = stmt.query_map([folder.as_str()], |row| row.get::<_, String>(0))?;
+    rows.map(|id| Ok(MessageId::from(id?)))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn set_folder_sync_state_tx(
+    tx: &Transaction<'_>,
+    folder: &FolderId,
+    state: Option<&str>,
+) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE folders SET sync_state = ?2 WHERE id = ?1",
+        params![folder.as_str(), state],
+    )?;
+    if changed == 0 {
+        return Err(folder_not_found(folder));
+    }
+    Ok(())
+}
+
+fn recount_tx(tx: &Transaction<'_>, folder: &FolderId) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE folders SET
+            total_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1),
+            unread_count = (
+                SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND is_read = 0
+            )
+         WHERE id = ?1",
+        [folder.as_str()],
+    )?;
+    if changed == 0 {
+        return Err(folder_not_found(folder));
+    }
+    Ok(())
+}
+
+fn optional_message_id(result: rusqlite::Result<String>) -> Result<Option<MessageId>> {
+    match result {
+        Ok(id) => Ok(Some(MessageId::from(id))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn folder_not_found(folder: &FolderId) -> CoreError {
+    let id = folder.as_str();
+    CoreError::NotFound(format!("folder {id}"))
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -745,22 +837,177 @@ mod tests {
         let account = account();
         store.insert_account(&account).unwrap();
         let folder = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
-        store
-            .upsert_messages(&[
-                message(&account.id, &folder.id, "a", 1, false),
-                message(&account.id, &folder.id, "b", 2, false),
-                message(&account.id, &folder.id, "c", 3, false),
-            ])
-            .unwrap();
+        let a = message(&account.id, &folder.id, "a", 1, false);
+        let b = message(&account.id, &folder.id, "b", 2, false);
+        let c = message(&account.id, &folder.id, "c", 3, false);
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        let c_id = c.id.clone();
+        store.upsert_messages(&[a, b, c]).unwrap();
 
-        store
-            .delete_messages(&folder.id, &["a".to_string()])
+        let removed = store
+            .delete_messages(&folder.id, &["a".to_string(), "missing".to_string()])
             .unwrap();
+        assert_eq!(removed, vec![a_id]);
         let left = store.messages(&folder.id, 0, 10).unwrap();
         assert_eq!(left.len(), 2);
         assert!(left.iter().all(|row| row.remote_id != "a"));
 
-        store.clear_folder(&folder.id).unwrap();
+        let cleared = store.clear_folder(&folder.id).unwrap();
+        assert_eq!(cleared.len(), 2);
+        assert!(cleared.contains(&b_id));
+        assert!(cleared.contains(&c_id));
         assert!(store.messages(&folder.id, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upsert_messages_returns_stored_ids() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        store.insert_account(&account).unwrap();
+        let folder = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+        let first = message(&account.id, &folder.id, "r1", 1_000, false);
+        let original_id = first.id.clone();
+        assert_eq!(
+            store.upsert_messages(std::slice::from_ref(&first)).unwrap(),
+            vec![original_id.clone()]
+        );
+
+        let mut again = message(&account.id, &folder.id, "r1", 2_000, true);
+        again.id = MessageId::new();
+        let fresh = message(&account.id, &folder.id, "r2", 3_000, false);
+        let fresh_id = fresh.id.clone();
+        assert_ne!(again.id, original_id);
+        assert_eq!(
+            store.upsert_messages(&[again, fresh]).unwrap(),
+            vec![original_id, fresh_id]
+        );
+    }
+
+    #[test]
+    fn apply_sync_page_is_atomic() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        store.insert_account(&account).unwrap();
+        let folder = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+        let keep = message(&account.id, &folder.id, "keep", 1_000, false);
+        let doomed = message(&account.id, &folder.id, "doomed", 2_000, false);
+        let keep_id = keep.id.clone();
+        store.upsert_messages(&[keep, doomed]).unwrap();
+        store.set_folder_sync_state(&folder.id, "before").unwrap();
+
+        let mut updated = message(&account.id, &folder.id, "keep", 1_500, true);
+        updated.id = MessageId::new();
+        let mut bad = message(&account.id, &folder.id, "bad", 3_000, false);
+        bad.folder_id = FolderId::new();
+
+        let err = store
+            .apply_sync_page(
+                &folder.id,
+                &[updated, bad],
+                &["doomed".to_string()],
+                "after",
+            )
+            .unwrap_err();
+        assert!(matches!(err, crate::CoreError::Storage(_)));
+
+        let rows = store.messages(&folder.id, 0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        let kept = rows.iter().find(|row| row.remote_id == "keep").unwrap();
+        assert_eq!(kept.id, keep_id);
+        assert!(!kept.is_read);
+        assert!(rows.iter().any(|row| row.remote_id == "doomed"));
+        assert_eq!(
+            store.folder_sync_state(&folder.id).unwrap().as_deref(),
+            Some("before")
+        );
+    }
+
+    #[test]
+    fn apply_sync_page_applies_all() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        store.insert_account(&account).unwrap();
+        let folder = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+        let a = message(&account.id, &folder.id, "a", 1, false);
+        let b = message(&account.id, &folder.id, "b", 2, true);
+        let c = message(&account.id, &folder.id, "c", 3, false);
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        store.upsert_messages(&[a, b, c]).unwrap();
+
+        let mut b_updated = message(&account.id, &folder.id, "b", 4, false);
+        b_updated.id = MessageId::new();
+        let d = message(&account.id, &folder.id, "d", 5, false);
+        let d_id = d.id.clone();
+
+        let applied = store
+            .apply_sync_page(&folder.id, &[b_updated, d], &["a".to_string()], "cursor-1")
+            .unwrap();
+        assert_eq!(applied.stored_ids, vec![b_id.clone(), d_id.clone()]);
+        assert_eq!(applied.removed_ids, vec![a_id]);
+
+        let rows = store.messages(&folder.id, 0, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.remote_id != "a"));
+        let stored_b = rows.iter().find(|row| row.remote_id == "b").unwrap();
+        assert_eq!(stored_b.id, b_id);
+        assert!(!stored_b.is_read);
+        assert!(rows.iter().any(|row| row.id == d_id));
+        assert_eq!(
+            store.folder_sync_state(&folder.id).unwrap().as_deref(),
+            Some("cursor-1")
+        );
+        let folders = store.folders(&account.id).unwrap();
+        assert_eq!(folders[0].total_count, 3);
+        assert_eq!(folders[0].unread_count, 3);
+    }
+
+    #[test]
+    fn reset_folder_clears_messages_and_state() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        store.insert_account(&account).unwrap();
+        let folder = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+        let a = message(&account.id, &folder.id, "a", 1, false);
+        let b = message(&account.id, &folder.id, "b", 2, true);
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        store.upsert_messages(&[a, b]).unwrap();
+        store.set_folder_sync_state(&folder.id, "cursor-1").unwrap();
+        store.recount(&folder.id).unwrap();
+
+        let removed = store.reset_folder(&folder.id).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&a_id));
+        assert!(removed.contains(&b_id));
+        assert!(store.messages(&folder.id, 0, 10).unwrap().is_empty());
+        assert_eq!(store.folder_sync_state(&folder.id).unwrap(), None);
+        let folders = store.folders(&account.id).unwrap();
+        assert_eq!(folders[0].total_count, 0);
+        assert_eq!(folders[0].unread_count, 0);
+    }
+
+    #[test]
+    fn message_id_for_remote_finds_and_misses() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        store.insert_account(&account).unwrap();
+        let folder = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+        let msg = message(&account.id, &folder.id, "r1", 1_000, false);
+        let id = msg.id.clone();
+        store.upsert_messages(std::slice::from_ref(&msg)).unwrap();
+
+        assert_eq!(
+            store
+                .message_id_for_remote(&folder.id, "r1")
+                .unwrap()
+                .as_ref(),
+            Some(&id)
+        );
+        assert_eq!(
+            store.message_id_for_remote(&folder.id, "missing").unwrap(),
+            None
+        );
     }
 }
