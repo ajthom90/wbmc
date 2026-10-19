@@ -132,7 +132,7 @@ apps/apple/UITests/LaunchTests.swift
 - [ ] **Step 4:** Implement `CoreError` with `thiserror`. Add `From` conversions for `rusqlite::Error` → `Storage`, `std::io::Error` → `Storage`, and `reqwest::Error` → `Network`.
 - [ ] **Step 5:** Run `cargo test -p wbmc-core`. Expected: PASS.
 - [ ] **Step 6:** Write `ci.yml`. It has two jobs:
-  - `rust-linux` on ubuntu-latest: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace`, with a GreenMail service container and `WBMC_TEST_IMAP=1`.
+  - `rust-linux` on ubuntu-latest: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace`, with a GreenMail service container, `WBMC_TEST_IMAP=1` and `WBMC_SECRETS=memory`.
   - `rust-macos` on macos-latest: `cargo test --workspace`.
   
   Add the `LICENSE` file (verbatim MPL-2.0 text) and a README with the one-paragraph pitch from spec §1 plus build instructions.
@@ -262,7 +262,8 @@ The owner needs this early so the registration is ready by Task 8.
 - **Produces:** `ImapProvider::new(config: ImapConfig, password: String)`.
 - **IMAP semantics:**
   - The first call with no state fetches the **newest** `page_size` UIDs (via `UID SEARCH ALL`) and returns `more = true` while older UIDs remain. Later calls with `more` page older messages, using `lowest_uid`.
-  - Once backfilled, a call fetches UIDs > `highest_uid`, refreshes flags for known UIDs in batches, and reports UIDs that have disappeared.
+  - Once backfilled, a call fetches UIDs > `highest_uid`, refreshes flags for known UIDs in batches, and reports UIDs that have disappeared. **Known cost:** refreshing flags is O(folder size) per sync. M5 replaces it with CONDSTORE/QRESYNC.
+  - If the server rejects the partial fetch `BODY.PEEK[TEXT]<0.1024>`, fall back to `BODY.PEEK[HEADER]` for headers and leave the snippet empty until the body is fetched.
   - A `uid_validity` change returns `reset = true` and restarts from scratch.
   - Headers come from `FETCH (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE BODY.PEEK[TEXT]<0.1024>)`. The snippet comes from that partial.
   - Folder roles come from SPECIAL-USE flags, with name heuristics as fallback (`Sent`, `Sent Items`, `Drafts`, `Trash`, `Deleted Items`, `Junk`, `Spam`, `Archive`; INBOX is always `Inbox`).
@@ -373,7 +374,7 @@ The owner needs this early so the registration is ready by Task 8.
   - `invalid_grant_maps_to_needs_sign_in`.
   - `token_manager_refreshes_only_when_near_expiry`.
 - [ ] **Step 2:** Run `cargo test -p wbmc-core auth`. Expected: FAIL.
-- [ ] **Step 3:** Implement. Load the client ID from `config/oauth-clients.toml` via `include_str!` + `toml`. If the ID is empty, `SignIn::start` returns `InvalidInput("Microsoft client ID not configured; see docs/setup/microsoft-entra-app.md")`.
+- [ ] **Step 3:** Implement. In `Cargo.toml`, enable the `keyring` platform backends (`apple-native`, `windows-native`, `sync-secret-service`); keyring 3.x has no default backend, and without these `KeyringSecrets` silently stores nothing. Load the client ID from `config/oauth-clients.toml` via `include_str!` + `toml`. If the ID is empty, `SignIn::start` returns `InvalidInput("Microsoft client ID not configured; see docs/setup/microsoft-entra-app.md")`.
 - [ ] **Step 4:** Run the tests. Expected: PASS.
 - [ ] **Step 5: Commit** with `git commit -m "feat(core): keychain secrets and Microsoft OAuth (PKCE loopback)"`.
 
@@ -394,7 +395,7 @@ The owner needs this early so the registration is ready by Task 8.
   - items with `@removed` go to `deleted_remote_ids`;
   - a `410 Gone` or `syncStateNotFound` response → `reset = true`, restarting without the link.
   
-  The delta API doesn't guarantee an order. That's acceptable: the store sorts by date, and the Inbox lands first by folder order.
+  The delta API doesn't guarantee an order. That's acceptable: the store sorts by date, and the Inbox lands first by folder order. **Known cost:** without `$orderby`, a 50k-message Inbox may not show its newest mail within seconds. M3 adds a parallel `GET /messages?$orderby=receivedDateTime desc&$top=200` first pass.
 - **Bodies:** `fetch_raw` uses `GET /me/messages/{id}/$value`.
 - **Errors:**
   - every request: on `401`, call `tokens.invalidate` and retry once;
@@ -423,7 +424,7 @@ The owner needs this early so the registration is ready by Task 8.
 **Interfaces:**
 - **Consumes:** everything from Tasks 3–8.
 - **Produces:** the UniFFI object `WbmcCore`, which Swift sees as `WbmcCoreProtocol`:
-  - `#[uniffi::constructor] new(data_dir: String, listener: Box<dyn CoreListener>) -> Result<Arc<Self>, FfiError>`;
+  - `#[uniffi::constructor] new(data_dir: String, listener: Box<dyn CoreListener>) -> Result<Arc<Self>, FfiError>`. It uses `KeyringSecrets`, unless the environment variable `WBMC_SECRETS=memory` is set, in which case it uses `MemorySecrets`. That's for tests and CI; Linux CI has no Secret Service, and unsigned test binaries must not touch the login keychain;
   - `accounts() -> Vec<AccountInfo>`;
   - `async add_imap_account(input: ImapAccountInput) -> Result<AccountInfo, FfiError>`, which verifies the login by calling `list_folders` before saving;
   - `begin_microsoft_sign_in() -> Result<Arc<MicrosoftSignIn>, FfiError>`, where `MicrosoftSignIn` has `url() -> String` and `async finish() -> Result<AccountInfo, FfiError>` (timeout 5 min);
@@ -448,7 +449,7 @@ The owner needs this early so the registration is ready by Task 8.
   - `add_imap_account_then_sync_then_read`: `accounts().len() == 1`; the Inbox has `total_count >= 500`; `messages(inbox, 0, 50).len() == 50`; `message_content(first).subject` is non-empty.
   - `bad_password_is_rejected_and_not_saved`: `accounts()` is empty afterwards.
   - `listener_receives_messages_changed`.
-- [ ] **Step 2:** Run `WBMC_TEST_IMAP=1 cargo test -p wbmc-ffi`. Expected: FAIL.
+- [ ] **Step 2:** Run `WBMC_TEST_IMAP=1 WBMC_SECRETS=memory cargo test -p wbmc-ffi`. Expected: FAIL. (CI sets `WBMC_SECRETS=memory` for every job.)
 - [ ] **Step 3:** Implement. `WbmcCore` owns a tokio multi-thread runtime, `Store`, `BodyStore`, `SyncEngine`, `TokenManager` (with `KeyringSecrets`) and a provider factory keyed by `ProviderKind`.
 - [ ] **Step 4:** Run the tests. Expected: PASS.
 - [ ] **Step 5:** Run `scripts/build-apple.sh && swift build --package-path apps/apple/WBMCCoreKit`. Expected: both succeed, and `Generated/wbmc_ffi.swift` exists.
@@ -485,7 +486,7 @@ The owner needs this early so the registration is ready by Task 8.
 - **Toolbar:** Refresh and Add Account. **Menu:** Debug ▸ "Copy refresh token…" (debug builds only, for `docs/setup/test-accounts.md`).
 - **Add Account sheet:** two choices, "Microsoft 365 / Outlook.com" and "Other (IMAP)".
   - **Microsoft:** opens the URL with `NSWorkspace.shared.open`, then awaits `finish()` with a progress state and cancel.
-  - **IMAP:** a form whose defaults are prefilled for `localhost:3143`/`3025`, security `None`, when the email ends in `@wbmc.test`.
+  - **IMAP:** a form. In `#if DEBUG` builds only, its defaults are prefilled for `localhost:3143`/`3025`, security `None`, when the email ends in `@wbmc.test`.
 - The data dir is `~/Library/Application Support/io.github.ajthom90.wbmc/`. `sync_all()` runs on launch and when Refresh is pressed.
 
 **Steps:**

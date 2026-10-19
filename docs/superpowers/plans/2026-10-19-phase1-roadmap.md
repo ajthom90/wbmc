@@ -11,9 +11,9 @@ Phase 1 is too large for one plan. It is split into milestones. Each milestone:
 |---|---|---|---|
 | M1 | **Foundation + read mail** (IMAP + Microsoft 365) | Sign in to M365 or the local test server; browse folders and read mail in the three-pane app | `2026-10-19-m1-foundation-read-mail.md` |
 | M2 | **Gmail + auto-setup + more providers** | Add Gmail by typing the address; Yahoo/AOL/iCloud via auto-config + app passwords; unified inbox | TBD |
-| M3 | **Instant search** | Results as you type across all accounts; full offline bodies; server fallback; 1M-message benchmark | TBD |
+| M3 | **Instant search** | Results as you type across all accounts; full offline bodies; server fallback; 1M-message benchmark; newest-first first pass for Graph on large folders | TBD |
 | M4 | **Act on mail** | Compose, reply and forward; send (SMTP, Graph, Gmail); drafts sync; move, archive, delete, flag, categories; offline action queue; undo send; send later; snooze | TBD |
-| M5 | **Always up to date** | Background login-item helper; IMAP IDLE/CONDSTORE; Graph and Gmail change tracking; notifications | TBD |
+| M5 | **Always up to date** | Background login-item helper; IMAP IDLE/CONDSTORE/QRESYNC (test server moves from GreenMail to Dovecot or Stalwart); connection pooling; Graph and Gmail change tracking; notifications | TBD |
 | M6 | **Calendar, contacts, tasks** | Calendar views, invites both ways, Teams links; contacts + autocomplete; basic tasks (To Do, Google Tasks, CalDAV/CardDAV) | TBD |
 | M7 | **MCP** | `wbmc-mcp` stdio + localhost; permission areas; Ask-me-first prompts; activity log + undo; injection guards | TBD |
 | M8 | **Polish + ship to owner** | Feature switches page; customization; keyboard shortcuts + ⌘K; sender checks; signed + notarized Developer ID build; perf targets verified | TBD |
