@@ -317,17 +317,17 @@ impl MailProvider for GraphProvider {
                 "page_size must be greater than 0".into(),
             ));
         }
-        let (previous_delta, url) = match state {
+        let (previous_delta, url, stored_link) = match state {
             Some(FolderSyncState::Graph {
                 next_link: Some(next),
                 delta_link,
-            }) => (delta_link, next),
+            }) => (delta_link, next, true),
             Some(FolderSyncState::Graph {
                 delta_link: Some(delta),
                 ..
-            }) => (Some(delta.clone()), delta),
+            }) => (Some(delta.clone()), delta, true),
             Some(FolderSyncState::Graph { .. }) | None => {
-                (None, self.initial_delta_url(&folder.remote_id)?)
+                (None, self.initial_delta_url(&folder.remote_id)?, false)
             }
             Some(FolderSyncState::Imap { .. }) => {
                 return Err(CoreError::InvalidInput("graph sync state required".into()));
@@ -339,6 +339,9 @@ impl MailProvider for GraphProvider {
         let bytes = read_limited(response, self.max_raw_bytes).await?;
         let code = error_code(&bytes);
         if status.as_u16() == 410 || code.as_deref().is_some_and(is_resync) {
+            if !stored_link {
+                return Err(protocol_error(status.as_u16(), code.as_deref()));
+            }
             return Ok(reset_delta());
         }
         if !status.is_success() {
@@ -449,7 +452,7 @@ fn reset_delta() -> FolderDelta {
             delta_link: None,
             next_link: None,
         },
-        more: false,
+        more: true,
         reset: true,
     }
 }
@@ -1302,7 +1305,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(delta.reset, "{token}");
-            assert!(!delta.more, "{token}");
+            assert!(delta.more, "{token}");
             assert!(delta.upserts.is_empty(), "{token}");
             assert!(delta.deleted_remote_ids.is_empty(), "{token}");
             assert_no_flag_side_channel(&delta);
@@ -1313,6 +1316,43 @@ mod tests {
                     next_link: None,
                 }
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_delta_gone_is_error() {
+        let env = env().await;
+        Mock::given(method("GET"))
+            .and(path(DELTA_PATH))
+            .and(query_param("$select", SELECT))
+            .respond_with(ResponseTemplate::new(410).set_body_json(serde_json::json!({
+                "error": {
+                    "code": "syncStateNotFound",
+                    "message": "dump-me"
+                }
+            })))
+            .mount(&env.server)
+            .await;
+
+        for state in [
+            None,
+            Some(FolderSyncState::Graph {
+                delta_link: None,
+                next_link: None,
+            }),
+        ] {
+            let err = env
+                .provider
+                .sync_folder(&inbox(), state, 10)
+                .await
+                .unwrap_err();
+            match err {
+                CoreError::Protocol(message) => {
+                    assert_eq!(message, "graph 410 syncStateNotFound");
+                    assert!(!message.contains("dump-me"));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
 
