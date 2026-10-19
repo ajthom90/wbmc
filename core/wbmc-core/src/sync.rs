@@ -200,7 +200,7 @@ impl SyncEngine {
             match self.body(account, provider, &message.id).await {
                 Err(error @ CoreError::NeedsSignIn { .. }) => return Err(error),
                 Err(error) => {
-                    eprintln!("body prefetch failed for {}: {error}", message.id.as_str());
+                    tracing::warn!("body prefetch failed for {}: {error}", message.id.as_str());
                 }
                 Ok(_) => {}
             }
