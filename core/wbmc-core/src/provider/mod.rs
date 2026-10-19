@@ -1,5 +1,8 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#[cfg(any(test, feature = "test-util"))]
+pub mod fake;
+
 mod imap;
 
 pub use imap::{ImapConfig, ImapProvider, Security};

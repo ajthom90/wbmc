@@ -37,6 +37,22 @@ pub struct PageApplied {
     pub removed_ids: Vec<MessageId>,
 }
 
+/// Provider-independent flag changes for a sync page.
+pub struct FlagChange {
+    pub remote_id: String,
+    pub is_read: bool,
+    pub is_flagged: bool,
+}
+
+/// All changes and the resumable cursor committed in one transaction.
+pub struct PageChanges<'a> {
+    pub upserts: &'a [MessageSummary],
+    pub deleted_remote_ids: &'a [String],
+    pub flag_updates: &'a [FlagChange],
+    pub retain_only_remote_ids: Option<&'a [String]>,
+    pub sync_state: &'a str,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -165,14 +181,16 @@ impl Store {
     pub fn apply_sync_page(
         &self,
         folder: &FolderId,
-        upserts: &[MessageSummary],
-        deleted_remote_ids: &[String],
-        sync_state: &str,
+        changes: &PageChanges<'_>,
     ) -> Result<PageApplied> {
         self.in_transaction(|tx| {
-            let stored_ids = upsert_messages_tx(tx, upserts)?;
-            let removed_ids = delete_messages_tx(tx, folder, deleted_remote_ids)?;
-            set_folder_sync_state_tx(tx, folder, Some(sync_state))?;
+            let stored_ids = upsert_messages_tx(tx, changes.upserts)?;
+            let mut removed_ids = delete_messages_tx(tx, folder, changes.deleted_remote_ids)?;
+            update_flags_tx(tx, folder, changes.flag_updates)?;
+            if let Some(remote_ids) = changes.retain_only_remote_ids {
+                removed_ids.extend(prune_messages_tx(tx, folder, remote_ids)?);
+            }
+            set_folder_sync_state_tx(tx, folder, Some(changes.sync_state))?;
             recount_tx(tx, folder)?;
             Ok(PageApplied {
                 stored_ids,
@@ -325,6 +343,39 @@ fn delete_messages_tx(
         }
     }
     Ok(removed_ids)
+}
+
+fn update_flags_tx(tx: &Transaction<'_>, folder: &FolderId, flags: &[FlagChange]) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "UPDATE messages SET is_read = ?3, is_flagged = ?4
+         WHERE folder_id = ?1 AND remote_id = ?2 AND (is_read != ?3 OR is_flagged != ?4)",
+    )?;
+    for flag in flags {
+        stmt.execute(params![
+            folder.as_str(),
+            flag.remote_id,
+            flag.is_read,
+            flag.is_flagged
+        ])?;
+    }
+    Ok(())
+}
+
+fn prune_messages_tx(
+    tx: &Transaction<'_>,
+    folder: &FolderId,
+    remote_ids: &[String],
+) -> Result<Vec<MessageId>> {
+    // One JSON parameter avoids SQLite's bind-variable limit on large mailboxes.
+    let remote_ids = json_text(&remote_ids)?;
+    let mut stmt = tx.prepare(
+        "DELETE FROM messages WHERE folder_id = ?1
+         AND remote_id NOT IN (SELECT value FROM json_each(?2)) RETURNING id",
+    )?;
+    let rows = stmt.query_map(params![folder.as_str(), remote_ids], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|id| Ok(MessageId::from(id?))).collect()
 }
 
 fn clear_folder_tx(tx: &Transaction<'_>, folder: &FolderId) -> Result<Vec<MessageId>> {
@@ -480,7 +531,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{BodyStore, Store};
+    use super::{BodyStore, FlagChange, PageChanges, Store};
     use crate::model::{
         Account, AccountId, Address, Folder, FolderId, FolderRole, MessageId, MessageSummary,
         ProviderKind,
@@ -904,9 +955,13 @@ mod tests {
         let err = store
             .apply_sync_page(
                 &folder.id,
-                &[updated, bad],
-                &["doomed".to_string()],
-                "after",
+                &PageChanges {
+                    upserts: &[updated, bad],
+                    deleted_remote_ids: &["doomed".to_string()],
+                    flag_updates: &[],
+                    retain_only_remote_ids: None,
+                    sync_state: "after",
+                },
             )
             .unwrap_err();
         assert!(matches!(err, crate::CoreError::Storage(_)));
@@ -942,7 +997,16 @@ mod tests {
         let d_id = d.id.clone();
 
         let applied = store
-            .apply_sync_page(&folder.id, &[b_updated, d], &["a".to_string()], "cursor-1")
+            .apply_sync_page(
+                &folder.id,
+                &PageChanges {
+                    upserts: &[b_updated, d],
+                    deleted_remote_ids: &["a".to_string()],
+                    flag_updates: &[],
+                    retain_only_remote_ids: None,
+                    sync_state: "cursor-1",
+                },
+            )
             .unwrap();
         assert_eq!(applied.stored_ids, vec![b_id.clone(), d_id.clone()]);
         assert_eq!(applied.removed_ids, vec![a_id]);
@@ -1009,5 +1073,149 @@ mod tests {
             store.message_id_for_remote(&folder.id, "missing").unwrap(),
             None
         );
+    }
+    #[test]
+    fn flag_updates_applied() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        store.insert_account(&account).unwrap();
+        let folder = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+        let msg = message(&account.id, &folder.id, "a", 1, false);
+        let id = msg.id.clone();
+        store.upsert_messages(&[msg]).unwrap();
+        // Reject redundant writes: unchanged flags must not issue an UPDATE.
+        store.lock().unwrap().execute_batch(
+            "CREATE TRIGGER reject_unchanged_flags BEFORE UPDATE OF is_read, is_flagged ON messages
+             WHEN OLD.is_read = NEW.is_read AND OLD.is_flagged = NEW.is_flagged
+             BEGIN SELECT RAISE(ABORT, 'redundant flag update'); END;"
+        ).unwrap();
+        let flags = [
+            FlagChange {
+                remote_id: "a".into(),
+                is_read: true,
+                is_flagged: true,
+            },
+            FlagChange {
+                remote_id: "missing".into(),
+                is_read: true,
+                is_flagged: false,
+            },
+        ];
+        let changes = PageChanges {
+            upserts: &[],
+            deleted_remote_ids: &[],
+            flag_updates: &flags,
+            retain_only_remote_ids: None,
+            sync_state: "flagged",
+        };
+        store.apply_sync_page(&folder.id, &changes).unwrap();
+        store.apply_sync_page(&folder.id, &changes).unwrap();
+        let msg = store.message(&id).unwrap().unwrap();
+        assert!(msg.is_read && msg.is_flagged);
+        let folder = &store.folders(&account.id).unwrap()[0];
+        assert_eq!((folder.total_count, folder.unread_count), (1, 0));
+    }
+
+    #[test]
+    fn retain_only_prunes_missing() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        store.insert_account(&account).unwrap();
+        let other = store.upsert_folder(&folder(&account.id, "other")).unwrap();
+        let folder = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+        let kept = message(&account.id, &folder.id, "a", 1, false);
+        let removed = message(&account.id, &folder.id, "b", 2, false);
+        let other_msg = message(&account.id, &other.id, "b", 2, false);
+        let removed_id = removed.id.clone();
+        store.upsert_messages(&[kept, removed, other_msg]).unwrap();
+        let applied = store
+            .apply_sync_page(
+                &folder.id,
+                &PageChanges {
+                    upserts: &[],
+                    deleted_remote_ids: &[],
+                    flag_updates: &[],
+                    retain_only_remote_ids: Some(&["a".into()]),
+                    sync_state: "pruned",
+                },
+            )
+            .unwrap();
+        assert_eq!(applied.removed_ids, vec![removed_id]);
+        assert_eq!(store.messages(&folder.id, 0, 10).unwrap().len(), 1);
+        assert_eq!(store.messages(&other.id, 0, 10).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .folders(&account.id)
+                .unwrap()
+                .iter()
+                .find(|f| f.id == folder.id)
+                .unwrap()
+                .total_count,
+            1
+        );
+        let applied = store
+            .apply_sync_page(
+                &folder.id,
+                &PageChanges {
+                    upserts: &[],
+                    deleted_remote_ids: &[],
+                    flag_updates: &[],
+                    retain_only_remote_ids: Some(&[]),
+                    sync_state: "empty",
+                },
+            )
+            .unwrap();
+        assert_eq!(applied.removed_ids.len(), 1);
+        assert!(store.messages(&folder.id, 0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn page_changes_roll_back_together() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        store.insert_account(&account).unwrap();
+        let folder = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+        let initial = [
+            message(&account.id, &folder.id, "a", 1, false),
+            message(&account.id, &folder.id, "b", 2, false),
+            message(&account.id, &folder.id, "c", 3, false),
+        ];
+        store.upsert_messages(&initial).unwrap();
+        store.set_folder_sync_state(&folder.id, "before").unwrap();
+        store.recount(&folder.id).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_cursor BEFORE UPDATE OF sync_state ON folders
+             BEGIN SELECT RAISE(ABORT, 'injected cursor failure'); END;",
+            )
+            .unwrap();
+        let error = store
+            .apply_sync_page(
+                &folder.id,
+                &PageChanges {
+                    upserts: &[message(&account.id, &folder.id, "d", 4, false)],
+                    deleted_remote_ids: &["b".into()],
+                    flag_updates: &[FlagChange {
+                        remote_id: "a".into(),
+                        is_read: true,
+                        is_flagged: true,
+                    }],
+                    retain_only_remote_ids: Some(&["a".into(), "d".into()]),
+                    sync_state: "after",
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, crate::CoreError::Storage(_)));
+        let mut rows = store.messages(&folder.id, 0, 10).unwrap();
+        rows.reverse();
+        assert_eq!(rows, initial);
+        assert_eq!(
+            store.folder_sync_state(&folder.id).unwrap().as_deref(),
+            Some("before")
+        );
+        let folder = &store.folders(&account.id).unwrap()[0];
+        assert_eq!((folder.total_count, folder.unread_count), (3, 3));
     }
 }

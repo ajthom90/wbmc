@@ -4,6 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+test-util = []
+
 [dependencies]
 async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
 async-trait = "0.1.92"
