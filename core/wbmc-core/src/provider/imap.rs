@@ -928,7 +928,7 @@ async fn partial_texts(
         let _greeting = read_line(&mut stream).await?;
     }
     write_cmd(&mut stream, &format!("A001 LOGIN {user} {password}")).await?;
-    let login = read_tagged(&mut stream, b"A001").await?;
+    let login = command_deadline(read_tagged(&mut stream, b"A001")).await?;
     if !tagged_ok(&login, b"A001") {
         return Err(CoreError::Protocol(format!(
             "partial fetch login failed: {}",
@@ -936,7 +936,7 @@ async fn partial_texts(
         )));
     }
     write_cmd(&mut stream, &format!("A002 EXAMINE {mailbox}")).await?;
-    let examined = read_tagged(&mut stream, b"A002").await?;
+    let examined = command_deadline(read_tagged(&mut stream, b"A002")).await?;
     if !tagged_ok(&examined, b"A002") {
         return Err(CoreError::Protocol(format!(
             "partial fetch examine failed: {}",
@@ -953,11 +953,33 @@ async fn partial_texts(
             &format!("{tag} UID FETCH {set} (UID {PARTIAL_TEXT})"),
         )
         .await?;
-        texts.extend(read_partial_bodies(&mut stream, tag.as_bytes()).await?);
+        let bodies = command_deadline(read_partial_bodies(
+            &mut stream,
+            tag.as_bytes(),
+            chunk.len(),
+        ))
+        .await?;
+        // Keep only UIDs we asked for, so a misbehaving server cannot grow this map.
+        texts.extend(bodies.into_iter().filter(|(uid, _)| chunk.contains(uid)));
     }
     // The bodies are already in hand. A LOGOUT failure must not drop them.
     note_logout(raw_logout(&mut stream).await);
     Ok(texts)
+}
+
+/// Bounds a whole raw command, not just each read, so a server that drips bytes
+/// or streams endless untagged lines cannot hold a sync open indefinitely.
+async fn command_deadline<T>(work: impl Future<Output = Result<T>>) -> Result<T> {
+    command_deadline_within(COMMAND_TIMEOUT, work).await
+}
+
+async fn command_deadline_within<T>(
+    limit: Duration,
+    work: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(limit, work)
+        .await
+        .map_err(|_| CoreError::Network("IMAP command timed out".into()))?
 }
 
 async fn raw_logout(stream: &mut MailStream) -> Result<()> {
@@ -968,7 +990,11 @@ async fn raw_logout(stream: &mut MailStream) -> Result<()> {
     Ok(())
 }
 
-async fn read_partial_bodies(stream: &mut MailStream, tag: &[u8]) -> Result<HashMap<u32, Vec<u8>>> {
+async fn read_partial_bodies(
+    stream: &mut MailStream,
+    tag: &[u8],
+    max_bodies: usize,
+) -> Result<HashMap<u32, Vec<u8>>> {
     let mut bodies = HashMap::new();
     let mut current_uid = None;
     // Some servers put UID after the literal, on the bytes that follow it.
@@ -993,6 +1019,11 @@ async fn read_partial_bodies(stream: &mut MailStream, tag: &[u8]) -> Result<Hash
             if let Some(body) = pending_body.take() {
                 bodies.insert(uid, body);
             }
+        }
+        if bodies.len() > max_bodies {
+            return Err(CoreError::Protocol(
+                "IMAP server returned more bodies than requested".into(),
+            ));
         }
         let text_section = contains_ignore_ascii_case(&line, b"BODY[TEXT]");
         if let Some(len) = literal_len(&line) {
@@ -1510,5 +1541,40 @@ mod tests {
             }
             other => panic!("expected a network error, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn raw_partial_fetch_rejects_more_bodies_than_requested() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for uid in 1..=5u32 {
+                let line = format!("* {uid} FETCH (UID {uid} BODY[TEXT]<0> {{2}}\r\nhi)\r\n");
+                if socket.write_all(line.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"B0000 OK done\r\n").await;
+            std::future::pending::<()>().await;
+        });
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = super::MailStream::Plain(tcp);
+        let error = super::read_partial_bodies(&mut stream, b"B0000", 2)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::Protocol(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn command_deadline_bounds_a_whole_command() {
+        let error = super::command_deadline_within(
+            Duration::from_millis(50),
+            std::future::pending::<crate::Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, CoreError::Network(_)), "{error}");
     }
 }
