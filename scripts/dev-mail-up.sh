@@ -25,13 +25,19 @@ import time
 host = "127.0.0.1"
 port = 4143
 deadline = time.time() + 60
+last = "no connection"
 while time.time() < deadline:
     try:
-        with socket.create_connection((host, port), timeout=2):
+        with socket.create_connection((host, port), timeout=2) as sock:
+            sock.settimeout(2)
+            banner = sock.recv(512).decode("utf-8", "replace")
+        if banner.startswith("* OK"):
             sys.exit(0)
-    except OSError:
-        time.sleep(0.5)
-print(f"timed out waiting for {host}:{port}", file=sys.stderr)
+        last = banner.splitlines()[0] if banner else "empty banner"
+    except OSError as exc:
+        last = str(exc)
+    time.sleep(0.5)
+print(f"timed out waiting for an IMAP banner from {host}:{port}: {last}", file=sys.stderr)
 sys.exit(1)
 PY
   exit 0

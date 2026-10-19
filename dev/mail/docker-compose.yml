@@ -10,10 +10,10 @@ services:
         -Dgreenmail.users=alice:password@wbmc.test,bob:password@wbmc.test
         -Dgreenmail.users.login=email
     ports:
-      - "3025:3025"
-      - "3143:3143"
-      - "3465:3465"
-      - "3993:3993"
+      - "127.0.0.1:3025:3025"
+      - "127.0.0.1:3143:3143"
+      - "127.0.0.1:3465:3465"
+      - "127.0.0.1:3993:3993"
 
   # 50k benchmark mailbox. Not started by `docker compose up` without --profile big.
   dovecot:

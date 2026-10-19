@@ -7,7 +7,7 @@ Headless numbers are from `cargo run --release -p wbmc-ffi --example m1_verify` 
 ## Step 1 — Local account, normal seed
 
 - [x] Inbox has 500+ messages. Measured inbox count **509**.
-- [x] Newest message is at the top within 3 s of adding the account. First page was readable **105 ms** after `add_imap_account` started (login included). Newest subject: `Seed message 0499`. The first 50 rows were newest-first. Full sync reached idle in **3422 ms**.
+- [x] Newest message is at the top within 3 s of adding the account. The first page counted only once it held 50 rows headed by `Seed message 0499`: **557 ms** after `add_imap_account` started (login included). Those rows were newest-first. Full sync reached idle in **21695 ms**.
 - [x] Corpus bodies, measured through `message_content` (the core decode, not the on-screen web view):
   - Café subject: `Café ☕ meeting`.
   - Latin-1 body contains `Viele Grüße`.
@@ -28,7 +28,7 @@ Maildir of **50009** messages (9 corpus + 50000 generated), written by `seed.py 
 
 - [x] Time to first page: **1977 ms** (within 3 s). Newest subject `Seed message 49999`, newest-first. Inbox count **50009**.
 - [x] Time to full backfill: sync reached idle in **622135 ms** (about 10.4 min). That clock includes the inbox body prefetch the engine runs before it reports idle.
-- [x] Peak RSS after that sync: **23,117,824 bytes (22 MiB)**. Target < 500 MB: pass. `ru_maxrss` on macOS is bytes.
+- [x] Peak RSS during the run: **23,117,824 bytes (22 MiB)**. Target < 500 MB: pass. `ru_maxrss` on macOS is the process high-water mark in bytes, not a sample taken after sync.
 - [ ] **Owner check — scrolling stays smooth.**
 - [ ] **Owner check — Activity Monitor.** Headless peak was 22 MiB; confirm in Activity Monitor if you want the GUI sample.
 
@@ -86,7 +86,7 @@ Re-ran after a normal GreenMail sync (`m1_verify`, then `m1_verify --offline` on
 
 3. In WBMC, choose **Add Account** (toolbar, or the empty-window button). Choose **Other (IMAP)**.
 4. Email: `alice@wbmc.test`. In a Debug build, an address ending in `@wbmc.test` fills the server fields: IMAP host `localhost`, port `3143`, security **None**, SMTP host `localhost`, port `3025`, security **None**. Username follows the email (`alice@wbmc.test`). Password: `password` (the GreenMail user in `dev/mail/docker-compose.yml`).
-5. Choose **Add Account**. The Inbox should show 500+ messages with the newest at the top within 3 s. Headless result: **105 ms**, **509** messages.
+5. Choose **Add Account**. The Inbox should show 500+ messages with the newest at the top within 3 s. Headless result: **557 ms**, **509** messages.
 
 To repeat the large-mailbox case, use Dovecot rather than GreenMail:
 

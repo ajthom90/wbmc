@@ -25,6 +25,14 @@ use wbmc_ffi::{
 };
 
 const FIRST_PAGE_TARGET_MS: u64 = 3_000;
+const FIRST_PAGE_ROWS: u32 = 50;
+/// `seed.py` numbers generated messages from 0 and formats the subject with
+/// `{index:04d}`, so the newest normal seed is 0499 and the newest `--big`
+/// seed is 49999.
+const NEWEST_DEFAULT: &str = "Seed message 0499";
+const NEWEST_BIG: &str = "Seed message 49999";
+/// Decoded subject of `dev/mail/corpus/rfc2047_subject.eml`.
+const CAFE_SUBJECT: &str = "Café ☕ meeting";
 const OFFLINE_TARGET_MS: u64 = 1_000;
 const RSS_TARGET_BYTES: u64 = 500 * 1024 * 1024;
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
@@ -109,6 +117,7 @@ struct ListenState {
     origin: Option<Instant>,
     idle: Option<Duration>,
     error: Option<String>,
+    saw_sync: bool,
 }
 
 impl Listener {
@@ -118,6 +127,7 @@ impl Listener {
                 origin: None,
                 idle: None,
                 error: None,
+                saw_sync: false,
             }),
         })
     }
@@ -144,6 +154,7 @@ impl CoreListener for Listener {
             return;
         };
         if let FfiEvent::SyncStatus { status, .. } = event {
+            state.saw_sync = true;
             match status {
                 FfiSyncStatus::Idle => {
                     if state.idle.is_none() {
@@ -162,13 +173,20 @@ impl CoreListener for Listener {
 struct FirstPage {
     elapsed: Duration,
     newest_first: bool,
+    expected_subject: String,
     first_subject: String,
+    subject_ok: bool,
     page_len: usize,
+    page_len_ok: bool,
 }
 
 fn run_online(big: bool, host: &str, port: u16) -> Value {
     let dir = tempfile::tempdir().expect("temp data dir");
     let data_dir = dir.keep();
+    eprintln!(
+        "data dir kept at {}; delete it when you are done",
+        data_dir.display()
+    );
     let listener = Listener::new();
     let core = match WbmcCore::new(data_dir.display().to_string(), listener.clone()) {
         Ok(core) => core,
@@ -184,7 +202,8 @@ fn run_online(big: bool, host: &str, port: u16) -> Value {
         let listener = Arc::clone(&listener);
         let first = Arc::clone(&first);
         let cancel = Arc::clone(&cancel);
-        thread::spawn(move || watch_first_page(core, listener, first, cancel))
+        let expected = expected_newest(big);
+        thread::spawn(move || watch_first_page(core, listener, first, cancel, expected))
     };
 
     listener.begin();
@@ -226,8 +245,11 @@ fn run_online(big: bool, host: &str, port: u16) -> Value {
     result["first_page_ms"] = json!(first_page_ms);
     result["first_page_under_3s"] = json!(first_page_ms <= FIRST_PAGE_TARGET_MS);
     result["newest_first"] = json!(page.newest_first);
+    result["expected_newest"] = json!(page.expected_subject);
     result["newest_subject"] = json!(page.first_subject);
+    result["newest_subject_ok"] = json!(page.subject_ok);
     result["first_page_len"] = json!(page.page_len);
+    result["first_page_len_ok"] = json!(page.page_len_ok);
 
     if let Err(error) = sync {
         result["pass"] = json!(false);
@@ -254,8 +276,14 @@ fn run_online(big: bool, host: &str, port: u16) -> Value {
         let under = rss < RSS_TARGET_BYTES;
         result["large_mailbox"] = json!(large);
         result["under_500mb"] = json!(under);
-        result["pass"] =
-            json!(page.newest_first && large && under && first_page_ms <= FIRST_PAGE_TARGET_MS);
+        result["pass"] = json!(
+            page.newest_first
+                && page.subject_ok
+                && page.page_len_ok
+                && large
+                && under
+                && first_page_ms <= FIRST_PAGE_TARGET_MS
+        );
         return result;
     }
 
@@ -264,6 +292,8 @@ fn run_online(big: bool, host: &str, port: u16) -> Value {
     result["corpus"] = corpus;
     result["pass"] = json!(
         page.newest_first
+            && page.subject_ok
+            && page.page_len_ok
             && folder.total_count >= 500
             && first_page_ms <= FIRST_PAGE_TARGET_MS
             && corpus_ok
@@ -284,11 +314,16 @@ fn mode_name(big: bool) -> &'static str {
     if big { "big" } else { "default" }
 }
 
+fn expected_newest(big: bool) -> &'static str {
+    if big { NEWEST_BIG } else { NEWEST_DEFAULT }
+}
+
 fn watch_first_page(
     core: Arc<WbmcCore>,
     listener: Arc<Listener>,
     slot: Arc<Mutex<Option<FirstPage>>>,
     cancel: Arc<AtomicBool>,
+    expected: &str,
 ) {
     let deadline = Instant::now() + ONLINE_TIMEOUT;
     while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
@@ -299,19 +334,43 @@ fn watch_first_page(
         if let Some(account) = core.accounts().into_iter().next()
             && let Some(folder) = inbox(&core, &account.id)
         {
-            let rows = core.messages(folder.id, 0, 50);
-            if !rows.is_empty() {
-                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(FirstPage {
-                    elapsed: origin.elapsed(),
-                    newest_first: is_newest_first(&rows),
-                    first_subject: rows[0].subject.clone(),
-                    page_len: rows.len(),
-                });
+            let rows = core.messages(folder.id, 0, FIRST_PAGE_ROWS);
+            if let Some(page) = ready_page(&rows, folder.total_count, expected, origin.elapsed()) {
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(page);
                 return;
             }
         }
         thread::sleep(POLL);
     }
+}
+
+/// The clock stops only once the visible page is the newest mail and is long
+/// enough: at least `min(50, total)` rows, not the first non-empty read.
+fn ready_page(
+    rows: &[MessageRow],
+    total: u32,
+    expected: &str,
+    elapsed: Duration,
+) -> Option<FirstPage> {
+    if total == 0 || rows.is_empty() {
+        return None;
+    }
+    let need = usize::try_from(total.min(FIRST_PAGE_ROWS)).unwrap_or(usize::MAX);
+    let subject_ok = rows[0].subject == expected;
+    let page_len_ok = rows.len() >= need;
+    let newest_first = is_newest_first(rows);
+    if !subject_ok || !page_len_ok || !newest_first {
+        return None;
+    }
+    Some(FirstPage {
+        elapsed,
+        newest_first,
+        expected_subject: expected.to_string(),
+        first_subject: rows[0].subject.clone(),
+        subject_ok,
+        page_len: rows.len(),
+        page_len_ok,
+    })
 }
 
 fn wait_for_sync(
@@ -360,9 +419,7 @@ fn corpus_checks(core: &WbmcCore, folder: &FolderInfo) -> Value {
     let inline = find_subject(core, &folder.id, folder.total_count, "Inline image");
     let remote = find_subject(core, &folder.id, folder.total_count, "Remote content");
 
-    let cafe_ok = cafe
-        .as_ref()
-        .is_some_and(|row| row.subject.contains("Café"));
+    let cafe_ok = cafe.as_ref().is_some_and(|row| row.subject == CAFE_SUBJECT);
     let latin_body = body_text(core, latin.as_ref());
     let sjis_body = body_text(core, sjis.as_ref());
     let inline_html = body_html(core, inline.as_ref());
@@ -448,7 +505,11 @@ fn excerpt(text: Option<&str>) -> Option<String> {
 fn run_offline(dir: &str, started: Instant) -> Value {
     let path = Path::new(dir);
     let listener = Listener::new();
-    let core = match WbmcCore::new(dir.to_string(), listener) {
+    // `WbmcCore::new` opens the store and does not start a sync. With
+    // `WBMC_SECRETS=memory` this process also has no IMAP password, so a cache
+    // miss cannot open a connection. `sync_started` is still measured: any
+    // sync status event, or an account left in "syncing".
+    let core = match WbmcCore::new(dir.to_string(), listener.clone()) {
         Ok(core) => core,
         Err(error) => {
             return json!({
@@ -481,13 +542,16 @@ fn run_offline(dir: &str, started: Instant) -> Value {
             Some("no cached inbox message to open".to_string()),
         ),
     };
+    let account_status = account.map(|account| account.status.clone());
+    let sync_started = listener.snapshot().saw_sync || account_status.as_deref() == Some("syncing");
     let store_readable = !accounts.is_empty() && folder.is_some() && !page.is_empty();
     json!({
         "mode": "offline",
         "data_dir": dir,
-        "sync_started": false,
+        "account_status": account_status,
+        "sync_started": sync_started,
         "elapsed_ms": elapsed_ms,
-        "under_1000ms": elapsed_ms < OFFLINE_TARGET_MS && store_readable && body_readable,
+        "under_1000ms": elapsed_ms < OFFLINE_TARGET_MS && store_readable && body_readable && !sync_started,
         "accounts": accounts.len(),
         "inbox_count": folder.as_ref().map(|folder| folder.total_count),
         "first_page_len": page.len(),
@@ -496,7 +560,7 @@ fn run_offline(dir: &str, started: Instant) -> Value {
         "body_subject": body_subject,
         "body_error": body_error,
         "cached_body_files": cached_body_files,
-        "pass": elapsed_ms < OFFLINE_TARGET_MS && store_readable && body_readable,
+        "pass": elapsed_ms < OFFLINE_TARGET_MS && store_readable && body_readable && !sync_started,
     })
 }
 

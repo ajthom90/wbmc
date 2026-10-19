@@ -159,10 +159,10 @@ def write_dovecot_maildir(root: Path, force: bool) -> None:
     home = root / "alice@wbmc.test"
     maildir = home / "Maildir"
     new = maildir / "new"
-    for directory in (new, maildir / "cur", maildir / "tmp"):
+    # Dovecot writes indexes under the account home and the Maildir folders.
+    # The caller-supplied root keeps its existing mode.
+    for directory in (home, maildir, new, maildir / "cur", maildir / "tmp"):
         directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(directory, 0o777)
-    for directory in (root, home, maildir):
         os.chmod(directory, 0o777)
 
     marker = new / maildir_name(count - 1)
