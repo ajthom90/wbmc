@@ -25,7 +25,7 @@ Do this once for `wbmc-test1` and once for `wbmc-test2`.
 3. Select **Add members to this mailbox** > **Add members**, tick `wbmc-test1` and `wbmc-test2`, then **Add**.
 4. In the Exchange admin center go to **Recipients** > **Mailboxes**, select `wbmc-shared`, then **Manage mailbox delegation** and confirm both test users have **Read and manage (Full Access)** and **Send as**. Add them if missing.
 
-No license is needed for a shared mailbox (under 50 GB, no archive, no litigation hold). Shared mailboxes have sign-in blocked by default; leave it that way. Tests reach it as a delegate through a test user's token.
+No license is needed for a shared mailbox (under 50 GB, no archive, no litigation hold). Shared mailboxes have sign-in blocked by default; leave it that way. Tests reach it as a delegate through a test user's token, using the delegated `.Shared` Graph scopes (`Mail.ReadWrite.Shared`, `Mail.Send.Shared`, `Calendars.ReadWrite.Shared`, `Contacts.ReadWrite.Shared`) granted in the Entra app guide.
 
 ## 3. Create the room mailbox
 

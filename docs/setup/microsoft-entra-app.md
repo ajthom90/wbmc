@@ -13,7 +13,7 @@ Portal labels change from time to time. If something below is not where it says,
 3. In the left navigation go to **Entra ID** > **App registrations**, then select **New registration**.
 4. **Name**: `WBMC`.
 5. **Supported account types**: choose **Accounts in any organizational directory and personal Microsoft accounts**. (The drop-down may label this "Any Entra ID Tenant + Personal Microsoft accounts".)
-6. Leave **Redirect URI** empty here; you set it in the next step (the registration form does not offer the right platform choice for a loopback address).
+6. Leave **Redirect URI** empty here; you set it in the next step (the form does offer "Public client/native (mobile & desktop)", but it is cleaner to add `http://localhost` under **Authentication**).
 7. Select **Register**.
 8. On the **Overview** page, copy the **Application (client) ID** (a GUID). You need it in step 5.
 
@@ -47,8 +47,14 @@ Requesting everything now means users never get a second consent prompt when a l
    - `Contacts.ReadWrite`
    - `Tasks.ReadWrite`
    - `People.Read`
+   - `Mail.ReadWrite.Shared`
+   - `Mail.Send.Shared`
+   - `Calendars.ReadWrite.Shared`
+   - `Contacts.ReadWrite.Shared`
+
+   The `.Shared` scopes are for delegated access to shared mailboxes and delegated calendars (Phase 2), so you consent only once.
 4. Select **Add permissions**.
-5. Check that all nine appear under **Configured permissions** with type **Delegated**. Do not add any **Application** permissions.
+5. Check that all 13 appear under **Configured permissions** with type **Delegated**. Do not add any **Application** permissions.
 
 ## 5. Grant admin consent for your tenant
 
