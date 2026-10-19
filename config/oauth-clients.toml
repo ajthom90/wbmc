@@ -1,0 +1,11 @@
+# OAuth public client configuration for WBMC.
+#
+# This file holds PUBLIC client IDs only. A client ID identifies the app to the
+# identity provider and is not a secret, so it is safe to commit. Never put
+# client secrets, tokens, or passwords here.
+#
+# See docs/setup/microsoft-entra-app.md for how to obtain the Microsoft value.
+
+[microsoft]
+client_id = ""   # filled in by the owner
+authority = "https://login.microsoftonline.com/common"
