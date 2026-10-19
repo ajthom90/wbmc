@@ -58,7 +58,7 @@ struct SafeHTMLViewTests {
         }
     }
 
-    @Test func securityMetadataIsFirstInHeadAndSpeculativeLinksAreRemoved() {
+    @Test func securityMetadataComesBeforeTheDocumentAndRemoteLinksAreRemoved() {
         let html = """
         <!DOCTYPE html><HTML><HEAD data-test="a > b"><title>Mail</title>
         <LiNk ReL="dns-prefetch" href="//tracker.example.com">
@@ -70,20 +70,20 @@ struct SafeHTMLViewTests {
         </HEAD><body>Keep this mail.</body></HTML>
         """
         let secured = SafeHTMLView.securedHTML(html)
-        #expect(secured.hasPrefix("<!DOCTYPE html><HTML><HEAD data-test=\"a > b\">" + SafeHTMLView.securityMetadata))
+        #expect(secured.hasPrefix(SafeHTMLView.securityMetadata + "<!DOCTYPE html><HTML><HEAD data-test=\"a > b\">"))
         #expect(!secured.contains("tracker.example.com"))
         #expect(!secured.contains("content='on'"))
         #expect(secured.contains("data:image/png;base64,AA=="))
         #expect(secured.contains("Keep this mail."))
     }
 
-    @Test func fragmentsGetASecurityHeadAndEncodedHintsAreRemoved() {
+    @Test func fragmentsStartWithMetadataAndEncodedHintsAreRemoved() {
         let secured = SafeHTMLView.securedHTML("""
         <link rel='dns&#45;prefetch' href='//tracker.example.com'>
         <link rel=stylesheet href='h&#116;tps://tracker.example.com/style.css'>
         <meta http-equiv='x-dns-prefetch-contr&#111;l' content=on><p>Message</p>
         """)
-        #expect(secured.hasPrefix("<head>" + SafeHTMLView.securityMetadata + "</head>"))
+        #expect(secured.hasPrefix(SafeHTMLView.securityMetadata))
         #expect(!secured.contains("tracker.example.com"))
         #expect(!secured.contains("content=on"))
         #expect(secured.hasSuffix("<p>Message</p>"))
@@ -92,7 +92,108 @@ struct SafeHTMLViewTests {
     @Test func commentsAndRawTextCannotImpersonateTheHead() {
         let html = "<!-- <head> --> <script>const fake = '<head>';</script><HEAD><title>Mail</title></HEAD>"
         let secured = SafeHTMLView.securedHTML(html)
-        #expect(secured.contains("<HEAD>" + SafeHTMLView.securityMetadata + "<title>"))
+        #expect(secured.hasPrefix(SafeHTMLView.securityMetadata + html))
+        #expect(secured.contains("const fake = '<head>';"))
+    }
+
+    @Test func bareLessThanWithAnUnterminatedQuoteCannotHidePreconnect() {
+        for html in [#"a <= "b <link rel=preconnect href=https://x>"#,
+                     #"a <= "b <link rel=preconnect href=https://x>" later <p>Keep</p>"#] {
+            let secured = SafeHTMLView.securedHTML(html)
+            #expect(!secured.contains("<link"))
+            #expect(!secured.contains("https://x"))
+            #expect(secured.contains(#"a <= "b "#))
+        }
+    }
+
+    @Test func quotesInTagAndAttributeNamesCannotHideLaterHints() {
+        for html in [#"<odd= "><link rel=preconnect href=https://x>"#,
+                     #"<div ="><link rel=preconnect href=https://x>"#] {
+            let secured = SafeHTMLView.securedHTML(html)
+            #expect(!secured.contains("<link"))
+            #expect(!secured.contains("https://x"))
+        }
+    }
+
+    @Test func lateHeadCannotPlaceCSPAfterAnImage() {
+        let secured = SafeHTMLView.securedHTML("<img src=https://x><head><title>Mail</title></head>")
+        #expect(secured.hasPrefix(SafeHTMLView.securityMetadata + "<img"))
+    }
+
+    @Test func securityMetadataPrecedesTheLeadingDocumentPrefix() {
+        let prefix = "<!DOCTYPE html><!-- lead --><html lang='en'>\n"
+        let secured = SafeHTMLView.securedHTML(prefix + "<img src=https://x><head></head>")
+        #expect(secured.hasPrefix(SafeHTMLView.securityMetadata + prefix + "<img"))
+    }
+
+    @Test func emptyCommentCannotHidePreconnect() {
+        let secured = SafeHTMLView.securedHTML("<!--><link rel=preconnect href=https://x>-->")
+        #expect(!secured.contains("<link"))
+        #expect(!secured.contains("https://x"))
+        #expect(secured.hasPrefix(SafeHTMLView.securityMetadata + "<!-->"))
+    }
+
+    @Test func abruptlyClosedCommentCannotHideDNSPrefetch() {
+        let secured = SafeHTMLView.securedHTML("<!---><link rel=dns-prefetch href=//x>")
+        #expect(!secured.contains("<link"))
+        #expect(!secured.contains("//x"))
+    }
+
+    @Test func bangCommentEndCannotHidePreload() {
+        let secured = SafeHTMLView.securedHTML("<!-- --!><link rel=preload href=https://x>")
+        #expect(!secured.contains("<link"))
+        #expect(!secured.contains("https://x"))
+    }
+
+    @Test func unterminatedRealTagIsDroppedAtEOF() {
+        let secured = SafeHTMLView.securedHTML(#"<p>Keep</p><link rel=preconnect href="https://x"#)
+        #expect(!secured.contains("<link"))
+        #expect(!secured.contains("https://x"))
+        #expect(secured.hasSuffix("<p>Keep</p>"))
+    }
+
+    @Test func bogusCommentsEndAtTheFirstGreaterThanDespiteQuotes() {
+        for html in [#"<!bogus "><link rel=preconnect href=https://x>"#,
+                     #"<?bogus "><link rel=preload href=https://x>"#] {
+            let secured = SafeHTMLView.securedHTML(html)
+            #expect(!secured.contains("<link"))
+            #expect(!secured.contains("https://x"))
+        }
+    }
+
+    @Test func unterminatedLeadingCommentDoesNotSwallowCSP() {
+        let secured = SafeHTMLView.securedHTML("<!-- unclosed")
+        #expect(secured.hasPrefix(SafeHTMLView.securityMetadata + "<!-- unclosed"))
+    }
+
+    @Test func metadataIsAlwaysTheVeryFirstOutputBytes() {
+        for html in ["", " \n", "<!DOCTYPE html><!-- lead --><html><head></head>",
+                     "<img src=https://x><head>", "<!-- unclosed", #"a <= "b"#] {
+            let secured = SafeHTMLView.securedHTML(html)
+            #expect(Array(secured.utf8.prefix(SafeHTMLView.securityMetadata.utf8.count)) == Array(SafeHTMLView.securityMetadata.utf8))
+        }
+    }
+
+    @Test func allNonDataLinksAreRemovedRegardlessOfRel() {
+        for tag in ["<link rel=stylesheet href=https://x/a.css>",
+                    "<link rel=&#112;reconnect href=https://x>",
+                    "<link rel=unknown href=ftp://x/a>", "<link rel=icon>", "<link>"] {
+            #expect(SafeHTMLView.securedHTML(tag) == SafeHTMLView.securityMetadata)
+        }
+    }
+
+    @Test func dataLinksArePreservedAfterDecodingAndLeadingWhitespace() {
+        for tag in [#"<link rel=icon href="data:image/png;base64,AA==">"#,
+                    #"<link rel=icon href="  DaTa:image/png;base64,AA==">"#,
+                    #"<link rel=icon href="&#9;&#100;ata:image/png;base64,AA==">"#] {
+            #expect(SafeHTMLView.securedHTML(tag) == SafeHTMLView.securityMetadata + tag)
+        }
+    }
+
+    @Test func refreshAndBaseTagsAreRemoved() {
+        let html = "<base href=https://x/><meta http-equiv=refresh content='0;url=https://x'>"
+            + "<META HTTP-EQUIV='ref&#114;esh' content='0;url=https://x'><p>Keep</p>"
+        #expect(SafeHTMLView.securedHTML(html) == SafeHTMLView.securityMetadata + "<p>Keep</p>")
     }
 
     @Test func ruleListBlocksEveryNonLocalScheme() throws {
