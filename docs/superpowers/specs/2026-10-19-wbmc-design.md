@@ -320,7 +320,7 @@ Other providers are reached through generic auto-configuration.
   - Plans are cut into thin end-to-end slices, each ending in a macOS build the owner can run. For example: (1) sign in and read Microsoft 365 mail, (2) instant search, (3) compose and send, and so on.
   - The 1M-message benchmark runs locally on the Mac until CI runners exist.
 - **Plans must be split into independent, well-specified, separately reviewable tasks** with clear acceptance tests, so they can be handed to different builders.
-- The repository is a single monorepo **[Claude's call]**: `core/`, `apps/macos`, `apps/windows`, `apps/ios`, `apps/linux`, `apps/android`, `relay/`, `docs/`.
+- The repository is a single monorepo **[Claude's call]**: `core/` (Rust workspace), `apps/apple` (macOS, iOS and iPadOS share one Xcode project and Swift package), `apps/windows`, `apps/linux`, `apps/android`, `relay/`, `dev/` (local test servers), `docs/`.
 
 ## 13. Left to the builder
 
