@@ -7,4 +7,10 @@ license.workspace = true
 [dependencies]
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 thiserror = "2.0.21"
+uuid = { version = "1.28.0", features = ["v7", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
