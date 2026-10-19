@@ -29,6 +29,7 @@ Maildir of **50009** messages (9 corpus + 50000 generated), written by `seed.py 
 - [x] Time to first page: **1977 ms** (within 3 s). Newest subject `Seed message 49999`, newest-first. Inbox count **50009**.
 - [x] Time to full backfill: sync reached idle in **622135 ms** (about 10.4 min). That clock includes the inbox body prefetch the engine runs before it reports idle.
 - [x] Peak RSS during the run: **23,117,824 bytes (22 MiB)**. Target < 500 MB: pass. `ru_maxrss` on macOS is the process high-water mark in bytes, not a sample taken after sync.
+- [x] Re-run after the final fix wave (commit with the sync_folder deadline change, stricter first-page check): first page **880 ms** with **50** rows headed by `Seed message 49999`; idle in **591728 ms**; peak RSS **23,805,952 bytes (22 MiB)**. `pass: true`.
 - [ ] **Owner check — scrolling stays smooth.**
 - [ ] **Owner check — Activity Monitor.** Headless peak was 22 MiB; confirm in Activity Monitor if you want the GUI sample.
 

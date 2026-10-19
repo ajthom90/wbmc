@@ -12,7 +12,8 @@ use crate::store::{BodyStore, FlagChange, PageChanges, Store};
 use crate::{CoreError, Result};
 
 const PAGE_SIZE: u32 = 200;
-/// Bounds every provider call so a stalled server cannot pin the single-flight slot.
+/// Bounds single-shot provider calls (folder listing, body fetch) so a stalled server
+/// cannot pin the single-flight slot.
 const PROVIDER_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 async fn call_provider<T>(work: impl Future<Output = Result<T>>) -> Result<T> {
@@ -184,7 +185,10 @@ impl SyncEngine {
             .transpose()
             .map_err(|error| CoreError::Storage(format!("invalid folder sync state: {error}")))?;
         loop {
-            let delta = call_provider(provider.sync_folder(remote, state, PAGE_SIZE)).await?;
+            // No overall cap here: a healthy final page refreshes flags for every known
+            // message, which can exceed any fixed deadline on very large folders. Each
+            // provider command inside is already timed individually.
+            let delta = provider.sync_folder(remote, state, PAGE_SIZE).await?;
             if delta.reset {
                 self.remove_bodies(account, self.store.reset_folder(&folder.id)?)?;
             }
