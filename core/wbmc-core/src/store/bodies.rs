@@ -36,6 +36,10 @@ impl BodyStore {
         }
         if let Err(err) = fs::rename(&temporary, &path) {
             let _ = fs::remove_file(&temporary);
+            // Another writer finished the same message first. The bytes are on disk.
+            if path.exists() {
+                return Ok(());
+            }
             return Err(err.into());
         }
         Ok(())
@@ -82,7 +86,47 @@ fn path_component<'a>(id: &'a str, label: &str) -> Result<&'a str> {
 }
 
 fn temporary_path(final_path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let token = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut temporary = final_path.as_os_str().to_os_string();
-    temporary.push(".tmp");
+    // `<id>.eml.<counter>.<pid>.tmp`, so two writers of the same message do not share a temp file.
+    temporary.push(format!(".{token}.{}.tmp", std::process::id()));
     PathBuf::from(temporary)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::BodyStore;
+    use crate::model::{AccountId, MessageId};
+
+    #[test]
+    fn concurrent_puts_of_the_same_message_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BodyStore::new(dir.path().to_path_buf());
+        let account = AccountId::from("acct".to_string());
+        let message = MessageId::from("msg".to_string());
+        let first = b"first-body".as_slice();
+        let second = b"second-body".as_slice();
+        thread::scope(|scope| {
+            scope.spawn(|| store.put(&account, &message, first).unwrap());
+            scope.spawn(|| store.put(&account, &message, second).unwrap());
+        });
+        let stored = store.get(&account, &message).unwrap().unwrap();
+        assert!(
+            stored.as_slice() == first || stored.as_slice() == second,
+            "stored {stored:?}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("acct"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
 }

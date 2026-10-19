@@ -141,6 +141,48 @@ async fn add_imap_account_then_sync_then_read() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn adding_the_same_imap_account_updates_the_password() {
+    if !imap_tests_enabled() {
+        return;
+    }
+    let h = harness();
+    let first = h.core.add_imap_account(input("password")).await.unwrap();
+    wait_for_sync(&h.core, &first.id).await;
+    let id = AccountId::from(first.id.clone());
+    h.secrets.set(&password_key(&id), "stale-password").unwrap();
+    h.core.inner.events.set_status(&id, "needs_sign_in");
+
+    let mut again = input("password");
+    again.email = "Alice@WBMC.test".into();
+    again.display_name = "Renamed".into();
+    let updated = h.core.add_imap_account(again).await.unwrap();
+    assert_eq!(updated.id, first.id);
+    assert!(h.core.is_syncing(&first.id));
+    assert_eq!(h.core.accounts().len(), 1);
+    assert_eq!(h.core.accounts()[0].email, "alice@wbmc.test");
+    assert_eq!(h.core.accounts()[0].display_name, "Alice");
+    assert_ne!(h.core.accounts()[0].status, "needs_sign_in");
+    assert_eq!(
+        h.secrets.get(&password_key(&id)).unwrap().as_deref(),
+        Some("password")
+    );
+    wait_for_sync(&h.core, &first.id).await;
+    assert_eq!(h.core.accounts()[0].status, "idle");
+
+    let rejected = h.core.add_imap_account(input("wrong-password")).await;
+    assert!(
+        matches!(rejected, Err(FfiError::InvalidInput { .. })),
+        "bad password gave {rejected:?}"
+    );
+    assert_eq!(h.core.accounts().len(), 1);
+    assert_eq!(h.core.accounts()[0].id, first.id);
+    assert_eq!(
+        h.secrets.get(&password_key(&id)).unwrap().as_deref(),
+        Some("password")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn bad_password_is_rejected_and_not_saved() {
     if !imap_tests_enabled() {
         return;
@@ -201,7 +243,7 @@ async fn remove_account_deletes_secrets_and_bodies() {
     let body_dir = h.dir.path().join("bodies").join(&account.id);
     assert!(body_dir.is_dir(), "inbox bodies were not prefetched");
 
-    h.core.remove_account(account.id.clone()).unwrap();
+    h.core.remove_account(account.id.clone()).await.unwrap();
 
     assert!(h.core.accounts().is_empty());
     assert!(h.core.folders(account.id.clone()).is_empty());
@@ -209,7 +251,7 @@ async fn remove_account_deletes_secrets_and_bodies() {
     assert_eq!(h.secrets.get(&refresh_token_key(&id)).unwrap(), None);
     assert!(!body_dir.exists());
     assert!(matches!(
-        h.core.remove_account(account.id.clone()),
+        h.core.remove_account(account.id.clone()).await,
         Err(FfiError::NotFound { .. })
     ));
 }
@@ -484,7 +526,7 @@ async fn remove_account_during_sync_leaves_no_residue() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     h.secrets.set(&refresh_token_key(&id), "token").unwrap();
-    h.core.remove_account(account.id.clone()).unwrap();
+    h.core.remove_account(account.id.clone()).await.unwrap();
     let removed_at = h
         .events
         .events()

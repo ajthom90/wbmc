@@ -20,6 +20,10 @@ struct FakeState {
     deltas: HashMap<String, VecDeque<FolderDelta>>,
     fetch_errors: HashSet<(String, String)>,
     fail_after_pages: Option<u32>,
+    /// `sync_folder` for this remote id returns `NotFound`.
+    fail_sync_folder: Option<String>,
+    /// `sync_folder` for this remote id returns `NeedsSignIn`.
+    needs_sign_in_folder: Option<String>,
     reset_next: bool,
     auth_error: bool,
     auth_error_on_fetch: bool,
@@ -36,6 +40,8 @@ impl FakeProvider {
                 deltas: HashMap::new(),
                 fetch_errors: HashSet::new(),
                 fail_after_pages: None,
+                fail_sync_folder: None,
+                needs_sign_in_folder: None,
                 reset_next: false,
                 auth_error: false,
                 auth_error_on_fetch: false,
@@ -55,6 +61,23 @@ impl FakeProvider {
         let mut state = self.state.lock().expect("fake state poisoned");
         state.fail_after_pages = limit;
         state.pages = 0;
+    }
+
+    /// The next `sync_folder` calls for this remote id fail with `NotFound`.
+    /// Listing and body fetches are unaffected.
+    pub fn set_fail_sync_folder(&self, remote_id: Option<&str>) {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .fail_sync_folder = remote_id.map(str::to_string);
+    }
+
+    /// `sync_folder` for this remote id fails with `NeedsSignIn`.
+    pub fn set_needs_sign_in_folder(&self, remote_id: Option<&str>) {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .needs_sign_in_folder = remote_id.map(str::to_string);
     }
 
     pub fn set_reset_next(&self, reset: bool) {
@@ -129,6 +152,14 @@ impl MailProvider for FakeProvider {
         page_size: u32,
     ) -> Result<FolderDelta> {
         let mut state = self.begin_call()?;
+        if state.needs_sign_in_folder.as_deref() == Some(folder.remote_id.as_str()) {
+            return Err(CoreError::NeedsSignIn {
+                account_id: "fake".into(),
+            });
+        }
+        if state.fail_sync_folder.as_deref() == Some(folder.remote_id.as_str()) {
+            return Err(CoreError::NotFound(folder.name.clone()));
+        }
         if state
             .fail_after_pages
             .is_some_and(|limit| state.pages >= limit)

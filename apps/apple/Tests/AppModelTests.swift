@@ -13,6 +13,8 @@ final class FakeCore: WbmcCoreProtocol, Sendable {
         var messageRequests: [(String, UInt32, UInt32)] = []
         var rowCount = 250
         var unreadCount: UInt32 = 3
+        var customFolders: [String: [FolderInfo]] = [:]
+        var removedAccountIDs: [String] = []
     }
     let state = Mutex(State())
     let contentProvider: @Sendable (String) async throws -> MessageContent
@@ -23,10 +25,11 @@ final class FakeCore: WbmcCoreProtocol, Sendable {
 
     func accounts() -> [AccountInfo] { state.withLock { $0.accounts } }
     func folders(accountId: String) -> [FolderInfo] {
-        let unread = state.withLock { value in
+        let (custom, unread) = state.withLock { value in
             value.folderRequests.append(accountId)
-            return value.unreadCount
+            return (value.customFolders[accountId], value.unreadCount)
         }
+        if let custom { return custom }
         var inbox = Self.folder("inbox", account: accountId)
         inbox.unreadCount = unread
         return [inbox, Self.folder("other", account: accountId)]
@@ -53,7 +56,13 @@ final class FakeCore: WbmcCoreProtocol, Sendable {
     func addImapAccount(input: ImapAccountInput) async throws -> AccountInfo { accounts()[0] }
     func beginMicrosoftSignIn() throws -> MicrosoftSignIn { throw FfiError.InvalidInput(message: "Use FakeSignInStarter") }
     func debugRefreshToken(accountId: String) -> String? { "fake-secret" }
-    func removeAccount(accountId: String) throws {}
+    func removeAccount(accountId: String) async throws {
+        state.withLock { value in
+            value.removedAccountIDs.append(accountId)
+            value.accounts.removeAll { $0.id == accountId }
+            value.customFolders.removeValue(forKey: accountId)
+        }
+    }
     func syncAccount(accountId: String) async throws {}
     func syncAll() async {}
 }
@@ -102,12 +111,46 @@ struct AppModelTests {
         model.load()
         model.handle(.syncStatus(accountId: "a", status: .needsSignIn))
         #expect(model.accounts[0].status == "needs_sign_in")
+        #expect(model.accountErrors["a"] == "Please sign in to this account again.")
         model.handle(.syncStatus(accountId: "a", status: .syncing(done: 1)))
         #expect(model.accounts[0].status == "syncing")
         model.handle(.syncStatus(accountId: "a", status: .error(message: "Invalid IMAP credentials")))
         #expect(model.accountErrors["a"] == "Invalid IMAP credentials")
         model.handle(.syncStatus(accountId: "a", status: .idle))
         #expect(model.accountErrors["a"] == nil)
+        core.state.withLock { $0.accounts[0].kind = "imap" }
+        model.load()
+        model.handle(.syncStatus(accountId: "a", status: .needsSignIn))
+        #expect(model.accountErrors["a"] == "Sign-in failed. Add the account again with the new password to update it.")
+    }
+
+    @Test func removeAccountClearsItsSelectionAndReloads() async {
+        let core = FakeCore()
+        core.state.withLock { value in
+            value.accounts.append(AccountInfo(id: "b", kind: "imap", email: "other@wbmc.test", displayName: "Other", status: "idle"))
+            value.customFolders = [
+                "a": [FakeCore.folder("a-inbox", account: "a")],
+                "b": [FakeCore.folder("b-inbox", account: "b")],
+            ]
+        }
+        let model = AppModel(core: core)
+        model.load()
+        model.select(folder: "b-inbox")
+        await model.select(message: "m0")
+
+        await model.removeAccount(accountID: "a")
+        #expect(model.selectedFolderID == "b-inbox")
+        #expect(model.selectedMessageID == "m0")
+        #expect(model.accounts.map(\.id) == ["b"])
+        #expect(model.folders["a"] == nil)
+        #expect(core.state.withLock { $0.removedAccountIDs } == ["a"])
+
+        await model.removeAccount(accountID: "b")
+        #expect(model.selectedFolderID == nil)
+        #expect(model.selectedMessageID == nil)
+        #expect(model.content == nil)
+        #expect(model.accounts.isEmpty)
+        #expect(core.state.withLock { $0.removedAccountIDs } == ["a", "b"])
     }
 
     @Test func onlyMicrosoftAccountsOfferSignInAgain() {

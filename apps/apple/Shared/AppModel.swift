@@ -72,6 +72,22 @@ final class AppModel {
 
     func refresh() async { await core.syncAll() }
 
+    /// Deletes the account locally. Mail on the server is left alone.
+    /// Clears the open folder when it belonged to this account, then reloads.
+    func removeAccount(accountID: String) async {
+        let selectedBelongs = folders[accountID]?.contains { $0.id == selectedFolderID } ?? false
+        do {
+            try await core.removeAccount(accountId: accountID)
+        } catch {
+            errorMessage = friendlyError(error)
+            return
+        }
+        if selectedBelongs {
+            select(folder: nil)
+        }
+        load()
+    }
+
     func handle(_ event: FfiEvent) {
         switch event {
         case .accountsChanged:
@@ -105,7 +121,7 @@ final class AppModel {
                 accounts[index].status = "needs_sign_in"
                 accountErrors[accountID] = accounts[index].kind == "microsoft"
                     ? "Please sign in to this account again."
-                    : "Account credentials are unavailable. Check your account settings."
+                    : "Sign-in failed. Add the account again with the new password to update it."
             }
         }
     }

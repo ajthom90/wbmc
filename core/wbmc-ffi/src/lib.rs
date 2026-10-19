@@ -564,14 +564,40 @@ impl Inner {
                 }
                 other => other.into(),
             })?;
-        let config = serde_json::to_value(&config).map_err(|error| FfiError::Storage {
-            message: error.to_string(),
-        })?;
         let email = input.email.trim().to_string();
         let display_name = match input.display_name.trim() {
             "" => email.clone(),
             name => name.to_string(),
         };
+        let host = config.host.clone();
+        let username = config.username.clone();
+        let store = self.store.clone();
+        let wanted_email = email.clone();
+        let existing = blocking(move || {
+            Ok(store.accounts()?.into_iter().find(|account| {
+                account.kind == ProviderKind::Imap
+                    && account.email.eq_ignore_ascii_case(&wanted_email)
+                    && imap_host_user(account).is_some_and(|(stored_host, stored_user)| {
+                        stored_host.eq_ignore_ascii_case(&host) && stored_user == username
+                    })
+            }))
+        })
+        .await?;
+        if let Some(account) = existing {
+            // Same mailbox: keep the id and replace the password. A second row would
+            // sync in parallel and duplicate every folder.
+            let secrets = self.secrets.clone();
+            let key = password_key(&account.id);
+            let password = input.password;
+            blocking(move || secrets.set(&key, &password)).await?;
+            self.events.set_status(&account.id, "idle");
+            self.events.emit(CoreEvent::AccountsChanged);
+            self.spawn_sync(&account.id);
+            return Ok(self.account_info(&account));
+        }
+        let config = serde_json::to_value(&config).map_err(|error| FfiError::Storage {
+            message: error.to_string(),
+        })?;
         let account = Account {
             id: AccountId::new(),
             kind: ProviderKind::Imap,
@@ -613,27 +639,34 @@ impl Inner {
         Ok(self.account_info(&account))
     }
 
-    fn remove_account(&self, account_id: &AccountId) -> FfiResult<()> {
-        let exists = self
-            .store
-            .accounts()?
-            .iter()
-            .any(|account| &account.id == account_id);
+    async fn remove_account(self: Arc<Self>, account_id: AccountId) -> FfiResult<()> {
+        let store = self.store.clone();
+        let wanted = account_id.clone();
+        let exists =
+            blocking(move || Ok(store.accounts()?.iter().any(|account| account.id == wanted)))
+                .await?;
         if !exists {
             return Err(not_found(format!("account {}", account_id.as_str())));
         }
         // Mark first: from here on late events are dropped and finishing work re-purges.
         self.events.removed().insert(account_id.clone());
-        let running = self.syncing().get(account_id).cloned().flatten();
+        let running = self.syncing().get(&account_id).cloned().flatten();
         if let Some(task) = running {
             task.abort();
         }
-        if let Err(error) = self.store.delete_account(account_id) {
-            self.events.removed().remove(account_id);
-            return Err(error.into());
+        let store = self.store.clone();
+        let id = account_id.clone();
+        if let Err(error) = blocking(move || store.delete_account(&id)).await {
+            self.events.removed().remove(&account_id);
+            return Err(error);
         }
-        self.purge(account_id);
-        self.events.forget(account_id);
+        // Keychain deletes and removing every cached body must not run on the caller thread.
+        let purger = Arc::clone(&self);
+        let id = account_id.clone();
+        tokio::task::spawn_blocking(move || purger.purge(&id))
+            .await
+            .map_err(task_failed)?;
+        self.events.forget(&account_id);
         self.events.emit(CoreEvent::AccountsChanged);
         Ok(())
     }
@@ -679,6 +712,11 @@ fn parse_security(field: &str, value: &str) -> FfiResult<Security> {
             "{field} must be \"tls\", \"starttls\" or \"none\", not {other:?}"
         ))),
     }
+}
+
+fn imap_host_user(account: &Account) -> Option<(String, String)> {
+    let config: ImapConfig = serde_json::from_value(account.config.clone()).ok()?;
+    Some((config.host, config.username))
 }
 
 fn imap_config(input: &ImapAccountInput) -> FfiResult<ImapConfig> {
@@ -888,8 +926,12 @@ impl WbmcCore {
     }
 
     /// Deletes the account, its credentials and its cached message bodies.
-    pub fn remove_account(&self, account_id: String) -> FfiResult<()> {
-        self.inner.remove_account(&AccountId::from(account_id))
+    /// Keychain and body-directory work runs on the blocking pool.
+    pub async fn remove_account(&self, account_id: String) -> FfiResult<()> {
+        let inner = self.inner.clone();
+        self.inner
+            .run(inner.remove_account(AccountId::from(account_id)))
+            .await
     }
 
     pub fn folders(&self, account_id: String) -> Vec<FolderInfo> {

@@ -61,6 +61,7 @@ pub struct ImapConfig {
 pub struct ImapProvider {
     config: ImapConfig,
     password: String,
+    connect_timeout: Duration,
 }
 
 impl fmt::Debug for ImapProvider {
@@ -73,7 +74,19 @@ impl fmt::Debug for ImapProvider {
 
 impl ImapProvider {
     pub fn new(config: ImapConfig, password: String) -> Self {
-        Self { config, password }
+        Self {
+            config,
+            password,
+            connect_timeout: CONNECT_TIMEOUT,
+        }
+    }
+
+    /// Shortens the TCP, STARTTLS-write, and TLS-handshake deadline. Tests use this
+    /// so a silent peer fails quickly instead of waiting out `CONNECT_TIMEOUT`.
+    #[cfg(test)]
+    fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
     }
 
     async fn with_session<T>(
@@ -82,11 +95,14 @@ impl ImapProvider {
     ) -> Result<T> {
         let mut session = self.login().await?;
         let result = work(&mut session).await;
-        let logged_out = logout_session(&mut session).await;
-        match result {
-            Err(err) => Err(err),
-            Ok(value) => logged_out.map(|()| value),
+        // Logout is best-effort. A timed-out LOGOUT must not discard a page or body
+        // the server already returned.
+        if result.is_ok() {
+            note_logout(logout_session(&mut session).await);
+        } else {
+            let _ = logout_session(&mut session).await;
         }
+        result
     }
 
     async fn login(&self) -> Result<Session<MailStream>> {
@@ -126,7 +142,7 @@ impl ImapProvider {
 
     async fn tcp(&self) -> Result<TcpStream> {
         let addr = (self.config.host.as_str(), self.config.port);
-        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| {
                 CoreError::Network(format!(
@@ -140,12 +156,19 @@ impl ImapProvider {
     async fn starttls(&self) -> Result<MailStream> {
         let mut tcp = self.tcp().await?;
         let _greeting = read_line(&mut tcp).await?;
-        tcp.write_all(b"A001 STARTTLS\r\n")
-            .await
-            .map_err(|err| CoreError::Network(err.to_string()))?;
-        tcp.flush()
-            .await
-            .map_err(|err| CoreError::Network(err.to_string()))?;
+        tokio::time::timeout(self.connect_timeout, async {
+            tcp.write_all(b"A001 STARTTLS\r\n").await?;
+            tcp.flush().await?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|_| {
+            CoreError::Network(format!(
+                "timed out sending STARTTLS to {}:{}",
+                self.config.host, self.config.port
+            ))
+        })?
+        .map_err(|err| CoreError::Network(err.to_string()))?;
         let line = read_tagged(&mut tcp, b"A001").await?;
         if !tagged_ok(&line, b"A001") {
             return Err(CoreError::Protocol(format!(
@@ -162,9 +185,15 @@ impl ImapProvider {
                 CoreError::InvalidInput(format!("invalid TLS server name: {}", self.config.host))
             })?
             .to_owned();
-        tls_connector()?
-            .connect(name, tcp)
+        let connector = tls_connector()?;
+        tokio::time::timeout(self.connect_timeout, connector.connect(name, tcp))
             .await
+            .map_err(|_| {
+                CoreError::Network(format!(
+                    "timed out during TLS handshake with {}:{}",
+                    self.config.host, self.config.port
+                ))
+            })?
             .map_err(|err| CoreError::Network(err.to_string()))
     }
 }
@@ -446,7 +475,16 @@ async fn finish_session(
     let logged_out = logout_session(session).await;
     match result {
         Err(err) => Err(err),
-        Ok(delta) => logged_out.map(|()| delta),
+        Ok(delta) => {
+            note_logout(logged_out);
+            Ok(delta)
+        }
+    }
+}
+
+fn note_logout(result: Result<()>) {
+    if let Err(error) = result {
+        tracing::warn!("IMAP logout failed: {error}");
     }
 }
 
@@ -454,7 +492,8 @@ async fn logout_session(session: &mut Session<MailStream>) -> Result<()> {
     drain(session);
     match tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await {
         Err(_) => Err(CoreError::Network("IMAP logout timed out".into())),
-        Ok(_) => Ok(()),
+        Ok(Err(error)) => Err(map_imap(error)),
+        Ok(Ok(())) => Ok(()),
     }
 }
 
@@ -916,7 +955,8 @@ async fn partial_texts(
         .await?;
         texts.extend(read_partial_bodies(&mut stream, tag.as_bytes()).await?);
     }
-    raw_logout(&mut stream).await?;
+    // The bodies are already in hand. A LOGOUT failure must not drop them.
+    note_logout(raw_logout(&mut stream).await);
     Ok(texts)
 }
 
@@ -1286,9 +1326,11 @@ mod tests {
 
     use async_imap::imap_proto::NameAttribute;
 
+    use std::time::{Duration, Instant};
+
     use super::{
-        decode_modified_utf7, folder_from_listing, literal_len, page_plan, quote_imap,
-        snippet_from, uid_set,
+        ImapConfig, ImapProvider, Security, decode_modified_utf7, folder_from_listing, literal_len,
+        page_plan, quote_imap, snippet_from, uid_set,
     };
     use crate::CoreError;
     use crate::model::FolderRole;
@@ -1426,5 +1468,47 @@ mod tests {
         assert_eq!(literal_len(b"* 1 FETCH (BODY[TEXT]<0> {15}\r\n"), Some(15));
         assert_eq!(literal_len(b"* OK done\r\n"), None);
         assert_eq!(literal_len(b"* 1 FETCH (BODY[TEXT]<0>{15}"), None);
+    }
+
+    /// A peer that accepts TCP and then stays silent must not hang the handshake.
+    #[tokio::test]
+    async fn tls_handshake_times_out_when_peer_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _held = socket;
+            std::future::pending::<()>().await;
+        });
+        let provider = ImapProvider::new(
+            ImapConfig {
+                host: "127.0.0.1".into(),
+                port,
+                security: Security::Tls,
+                username: "alice".into(),
+                smtp_host: "127.0.0.1".into(),
+                smtp_port: 1,
+                smtp_security: Security::None,
+            },
+            "secret-password".into(),
+        )
+        .with_connect_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        let error = provider.open_stream().await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "handshake took {:?}",
+            started.elapsed()
+        );
+        match error {
+            CoreError::Network(message) => {
+                assert!(
+                    message.contains("timed out during TLS handshake"),
+                    "{message}"
+                );
+                assert!(!message.contains("secret-password"), "{message}");
+            }
+            other => panic!("expected a network error, got {other}"),
+        }
     }
 }

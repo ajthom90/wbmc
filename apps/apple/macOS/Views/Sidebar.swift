@@ -30,6 +30,7 @@ struct FolderNode: Identifiable {
 struct Sidebar: View {
     let model: AppModel
     let signInAgain: () -> Void
+    @State private var accountPendingRemoval: (id: String, email: String)?
 
     var body: some View {
         List(selection: Binding(get: { model.selectedFolderID }, set: { model.select(folder: $0) })) {
@@ -52,15 +53,37 @@ struct Sidebar: View {
                         case "error", "needs_sign_in":
                             Image(systemName: "exclamationmark.triangle")
                                 .help(model.accountErrors[account.id] ?? (account.status == "needs_sign_in"
-                                    ? "Account credentials are unavailable. Check your account settings."
+                                    ? "Sign-in failed. Add the account again with the new password to update it."
                                     : "Sync failed. Refresh to try again."))
                         default: EmptyView()
+                        }
+                    }
+                    .contextMenu {
+                        Button("Remove Account…") {
+                            accountPendingRemoval = (id: account.id, email: account.email)
                         }
                     }
                 }
             }
         }
         .listStyle(.sidebar)
+        .confirmationDialog(
+            accountPendingRemoval.map { "Remove \($0.email)?" } ?? "",
+            isPresented: Binding(
+                get: { accountPendingRemoval != nil },
+                set: { if !$0 { accountPendingRemoval = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove Account", role: .destructive) {
+                guard let pending = accountPendingRemoval else { return }
+                accountPendingRemoval = nil
+                Task { await model.removeAccount(accountID: pending.id) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Downloaded mail will be deleted from this Mac. Mail on the server is not affected.")
+        }
         .overlay {
             if model.accounts.isEmpty {
                 ContentUnavailableView("No Accounts", systemImage: "tray", description: Text("Add an account to read your mail."))

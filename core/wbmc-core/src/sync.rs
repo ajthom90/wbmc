@@ -1,7 +1,9 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::events::{CoreEvent, EventSink, SyncStatus};
 use crate::model::{Account, Folder, FolderId, FolderRole, MessageId, MessageSummary};
@@ -10,6 +12,24 @@ use crate::store::{BodyStore, FlagChange, PageChanges, Store};
 use crate::{CoreError, Result};
 
 const PAGE_SIZE: u32 = 200;
+/// Bounds every provider call so a stalled server cannot pin the single-flight slot.
+const PROVIDER_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn call_provider<T>(work: impl Future<Output = Result<T>>) -> Result<T> {
+    provider_call_with_timeout(PROVIDER_CALL_TIMEOUT, work).await
+}
+
+async fn provider_call_with_timeout<T>(
+    timeout: Duration,
+    work: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(timeout, work).await {
+        Ok(result) => result,
+        Err(_) => Err(CoreError::Network(
+            "the mail server did not respond in time".into(),
+        )),
+    }
+}
 
 pub struct SyncEngine {
     store: Arc<Store>,
@@ -66,31 +86,54 @@ impl SyncEngine {
             .into_iter()
             .find(|folder| folder.id == message.folder_id)
             .ok_or_else(|| CoreError::NotFound(format!("folder {}", message.folder_id.as_str())))?;
-        let raw = provider
-            .fetch_raw(&folder.remote_id, &message.remote_id)
-            .await?;
+        let raw = call_provider(provider.fetch_raw(&folder.remote_id, &message.remote_id)).await?;
         self.bodies.put(&account.id, id, &raw)?;
         Ok(raw)
     }
 
     async fn sync(&self, account: &Account, provider: &dyn MailProvider) -> Result<()> {
-        let remote_folders = provider.list_folders().await?;
+        let remote_folders = call_provider(provider.list_folders()).await?;
         let mut folders = self.upsert_folders(account, remote_folders)?;
         self.events.emit(CoreEvent::FoldersChanged {
             account_id: account.id.clone(),
         });
         folders.sort_by_key(|(folder, _)| role_order(folder.role));
         let mut done = 0;
+        // One folder's failure must not skip the rest or the Inbox prefetch.
+        // NeedsSignIn is account-wide and still stops the pass.
+        let mut failed = Vec::new();
         for (folder, remote) in &folders {
-            self.sync_folder(account, provider, folder, remote, &mut done)
-                .await?;
+            match self
+                .sync_folder(account, provider, folder, remote, &mut done)
+                .await
+            {
+                Ok(()) => {}
+                Err(error @ CoreError::NeedsSignIn { .. }) => return Err(error),
+                Err(error) => {
+                    let label = if folder.name.is_empty() {
+                        remote.remote_id.clone()
+                    } else {
+                        folder.name.clone()
+                    };
+                    failed.push((label, error));
+                }
+            }
         }
         for (folder, _) in &folders {
             if folder.role == FolderRole::Inbox {
                 self.prefetch(account, provider, &folder.id).await?;
             }
         }
-        Ok(())
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            let detail = failed
+                .iter()
+                .map(|(name, error)| format!("{name}: {error}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CoreError::Protocol(format!("failed to sync {detail}")))
+        }
     }
 
     fn upsert_folders(
@@ -141,7 +184,7 @@ impl SyncEngine {
             .transpose()
             .map_err(|error| CoreError::Storage(format!("invalid folder sync state: {error}")))?;
         loop {
-            let delta = provider.sync_folder(remote, state, PAGE_SIZE).await?;
+            let delta = call_provider(provider.sync_folder(remote, state, PAGE_SIZE)).await?;
             if delta.reset {
                 self.remove_bodies(account, self.store.reset_folder(&folder.id)?)?;
             }
@@ -464,7 +507,8 @@ mod tests {
             h.statuses().last(),
             Some(SyncStatus::Error { .. })
         ));
-        assert_eq!(provider.provider_calls(), 3);
+        // list + the successful page + the failed page, then a prefetch of the 200 stored messages.
+        assert_eq!(provider.provider_calls(), 203);
         provider.set_fail_after_pages(None);
         h.engine.sync_account(&h.account, &provider).await.unwrap();
         let after = h.store.messages(&inbox.id, 0, 500).unwrap();
@@ -661,6 +705,119 @@ mod tests {
         for row in rows {
             assert!(h.bodies.get(&h.account.id, &row.id).unwrap().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn folder_failure_syncs_the_rest_and_prefetches() {
+        let h = Harness::new();
+        let provider = FakeProvider::new(
+            vec![
+                remote_folder("drafts", FolderRole::Drafts),
+                remote_folder("sent", FolderRole::Sent),
+                remote_folder("inbox", FolderRole::Inbox),
+            ],
+            HashMap::from([
+                ("inbox".into(), vec![remote_message(1)]),
+                ("sent".into(), vec![remote_message(2)]),
+                ("drafts".into(), vec![remote_message(3)]),
+            ]),
+        );
+        provider.set_fail_sync_folder(Some("sent"));
+
+        let error = h
+            .engine
+            .sync_account(&h.account, &provider)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("sent"), "{message}");
+        assert!(!message.contains("drafts"), "{message}");
+        assert!(matches!(
+            h.statuses().last(),
+            Some(SyncStatus::Error { message }) if message.contains("sent")
+        ));
+
+        let inbox_rows = h.store.messages(&h.folder("inbox").id, 0, 10).unwrap();
+        assert_eq!(inbox_rows.len(), 1);
+        assert!(
+            h.bodies
+                .get(&h.account.id, &inbox_rows[0].id)
+                .unwrap()
+                .is_some(),
+            "inbox prefetch did not run"
+        );
+        assert!(
+            h.store
+                .messages(&h.folder("sent").id, 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            h.store
+                .messages(&h.folder("drafts").id, 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        // list + inbox + failed sent + drafts + one body fetch.
+        assert_eq!(provider.provider_calls(), 5);
+    }
+
+    #[tokio::test]
+    async fn needs_sign_in_on_a_folder_stops_immediately() {
+        let h = Harness::new();
+        let provider = FakeProvider::new(
+            vec![
+                remote_folder("inbox", FolderRole::Inbox),
+                remote_folder("sent", FolderRole::Sent),
+                remote_folder("drafts", FolderRole::Drafts),
+            ],
+            HashMap::from([
+                ("inbox".into(), vec![remote_message(1)]),
+                ("sent".into(), vec![remote_message(2)]),
+                ("drafts".into(), vec![remote_message(3)]),
+            ]),
+        );
+        provider.set_needs_sign_in_folder(Some("sent"));
+
+        let error = h
+            .engine
+            .sync_account(&h.account, &provider)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::NeedsSignIn { .. }));
+        assert_eq!(h.statuses().last(), Some(&SyncStatus::NeedsSignIn));
+        let inbox_rows = h.store.messages(&h.folder("inbox").id, 0, 10).unwrap();
+        assert_eq!(inbox_rows.len(), 1);
+        assert!(
+            h.bodies
+                .get(&h.account.id, &inbox_rows[0].id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(h.folder("drafts").total_count, 0);
+        // list + inbox page + the NeedsSignIn folder. Drafts and prefetch do not run.
+        assert_eq!(provider.provider_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn provider_call_timeout_maps_to_network() {
+        let started = std::time::Instant::now();
+        let error = super::provider_call_with_timeout(
+            std::time::Duration::from_millis(20),
+            std::future::pending::<crate::Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "timed out in {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(error, CoreError::Network(ref message) if message.contains("did not respond")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
