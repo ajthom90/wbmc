@@ -3,8 +3,10 @@
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake;
 
+pub mod graph;
 mod imap;
 
+pub use graph::GraphProvider;
 pub use imap::{ImapConfig, ImapProvider, Security};
 
 use async_trait::async_trait;
