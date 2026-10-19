@@ -3,6 +3,7 @@
 pub mod error;
 pub mod mime;
 pub mod model;
+pub mod provider;
 pub mod store;
 
 pub use error::{CoreError, Result};
