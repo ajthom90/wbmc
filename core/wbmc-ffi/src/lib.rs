@@ -144,7 +144,7 @@ pub struct MessageContent {
     pub attachments: Vec<AttachmentInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ImapAccountInput {
     pub email: String,
     pub display_name: String,
@@ -157,6 +157,23 @@ pub struct ImapAccountInput {
     pub smtp_host: String,
     pub smtp_port: u16,
     pub smtp_security: String,
+}
+
+impl std::fmt::Debug for ImapAccountInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImapAccountInput")
+            .field("email", &self.email)
+            .field("display_name", &self.display_name)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("security", &self.security)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_security", &self.smtp_security)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -234,6 +251,8 @@ pub trait CoreListener: Send + Sync {
 struct EventBridge {
     listener: Arc<dyn CoreListener>,
     statuses: Mutex<HashMap<AccountId, &'static str>>,
+    /// Accounts removed in this process. Late events from in-flight work are dropped.
+    removed: Mutex<HashSet<AccountId>>,
 }
 
 impl EventBridge {
@@ -254,12 +273,30 @@ impl EventBridge {
     fn forget(&self, account_id: &AccountId) {
         self.statuses().remove(account_id);
     }
+
+    fn removed(&self) -> MutexGuard<'_, HashSet<AccountId>> {
+        self.removed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn is_removed(&self, account_id: &AccountId) -> bool {
+        self.removed().contains(account_id)
+    }
 }
 
 impl EventSink for EventBridge {
     fn emit(&self, event: CoreEvent) {
-        if let CoreEvent::SyncStatus { account_id, status } = &event {
-            self.set_status(account_id, status_name(status));
+        match &event {
+            CoreEvent::SyncStatus { account_id, .. } | CoreEvent::FoldersChanged { account_id }
+                if self.is_removed(account_id) =>
+            {
+                return;
+            }
+            CoreEvent::SyncStatus { account_id, status } => {
+                self.set_status(account_id, status_name(status));
+            }
+            _ => {}
         }
         self.listener.on_event(event.into());
     }
@@ -276,7 +313,8 @@ struct Inner {
     secrets: Arc<dyn SecretStore>,
     tokens: Arc<TokenManager>,
     events: Arc<EventBridge>,
-    syncing: Mutex<HashSet<AccountId>>,
+    /// Running syncs, with the task's abort handle once it is spawned.
+    syncing: Mutex<HashMap<AccountId, Option<tokio::task::AbortHandle>>>,
     runtime: tokio::runtime::Handle,
 }
 
@@ -288,6 +326,11 @@ struct SyncGuard {
 
 impl Drop for SyncGuard {
     fn drop(&mut self) {
+        // Runs on completion and on abort. A sync that outlived `remove_account` may have
+        // written bodies or a rotated refresh token, so purge again before releasing.
+        if self.inner.events.is_removed(&self.account_id) {
+            self.inner.purge(&self.account_id);
+        }
         self.inner.syncing().remove(&self.account_id);
     }
 }
@@ -305,7 +348,7 @@ where
 }
 
 impl Inner {
-    fn syncing(&self) -> MutexGuard<'_, HashSet<AccountId>> {
+    fn syncing(&self) -> MutexGuard<'_, HashMap<AccountId, Option<tokio::task::AbortHandle>>> {
         self.syncing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -313,8 +356,15 @@ impl Inner {
 
     /// Registers a sync for the account, or returns `None` when one is already running.
     fn try_begin_sync(self: &Arc<Self>, account_id: &AccountId) -> Option<SyncGuard> {
-        if !self.syncing().insert(account_id.clone()) {
+        if self.events.is_removed(account_id) {
             return None;
+        }
+        {
+            let mut syncing = self.syncing();
+            if syncing.contains_key(account_id) {
+                return None;
+            }
+            syncing.insert(account_id.clone(), None);
         }
         self.events.set_status(account_id, "syncing");
         Some(SyncGuard {
@@ -335,12 +385,40 @@ impl Inner {
     /// Starts a background sync unless one is already running for the account.
     fn spawn_sync(self: &Arc<Self>, account_id: &AccountId) {
         if let Some(guard) = self.try_begin_sync(account_id) {
-            let inner = self.clone();
-            self.runtime.spawn(async move {
-                if let Err(error) = inner.sync_with(guard).await {
-                    tracing::warn!("background sync failed: {error}");
-                }
-            });
+            drop(self.spawn_sync_task(guard));
+        }
+    }
+
+    /// Spawns the sync and records its abort handle so `remove_account` can stop it.
+    fn spawn_sync_task(
+        self: &Arc<Self>,
+        guard: SyncGuard,
+    ) -> tokio::task::JoinHandle<FfiResult<()>> {
+        let account_id = guard.account_id.clone();
+        let task = self.runtime.spawn(self.clone().sync_with(guard));
+        if let Some(slot) = self.syncing().get_mut(&account_id) {
+            *slot = Some(task.abort_handle());
+        }
+        // Removal may have happened between spawning and recording the handle.
+        if self.events.is_removed(&account_id) {
+            task.abort();
+        }
+        task
+    }
+
+    /// Deletes everything an account leaves outside the store. Idempotent.
+    fn purge(&self, account_id: &AccountId) {
+        for key in [password_key(account_id), refresh_token_key(account_id)] {
+            if let Err(error) = self.secrets.delete(&key) {
+                tracing::warn!("could not delete a credential of a removed account: {error}");
+            }
+        }
+        self.tokens.invalidate(account_id);
+        // The id came from the store, so it is a plain path component.
+        match std::fs::remove_dir_all(self.bodies_root.join(account_id.as_str())) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!("could not delete cached bodies: {error}"),
         }
     }
 
@@ -449,7 +527,17 @@ impl Inner {
         let raw = self
             .engine
             .body(&account, provider.as_ref(), &message_id)
-            .await?;
+            .await;
+        if self.events.is_removed(&account.id) {
+            // The fetch may have re-created the body directory after removal.
+            let inner = self.clone();
+            let id = account.id.clone();
+            tokio::task::spawn_blocking(move || inner.purge(&id))
+                .await
+                .map_err(task_failed)?;
+            return Err(not_found(format!("account {}", account.id.as_str())));
+        }
+        let raw = raw?;
         tokio::task::spawn_blocking(move || build_content(&message, &raw))
             .await
             .map_err(task_failed)
@@ -507,26 +595,7 @@ impl Inner {
         let store = self.store.clone();
         let manager = self.tokens.clone();
         let account = blocking(move || {
-            let existing = store.accounts()?.into_iter().find(|account| {
-                account.kind == ProviderKind::Microsoft
-                    && account.email.eq_ignore_ascii_case(&email)
-            });
-            let account = match existing {
-                Some(account) => account,
-                None => {
-                    let account = Account {
-                        id: AccountId::new(),
-                        kind: ProviderKind::Microsoft,
-                        display_name: email.clone(),
-                        email,
-                        config: serde_json::json!({}),
-                    };
-                    store.insert_account(&account)?;
-                    account
-                }
-            };
-            manager.store(&account.id, &tokens)?;
-            Ok(account)
+            save_microsoft_account(&store, email, |id| manager.store(id, &tokens))
         })
         .await?;
         // A re-sign-in clears any previous NeedsSignIn state.
@@ -545,23 +614,52 @@ impl Inner {
         if !exists {
             return Err(not_found(format!("account {}", account_id.as_str())));
         }
-        self.store.delete_account(account_id)?;
-        for key in [password_key(account_id), refresh_token_key(account_id)] {
-            if let Err(error) = self.secrets.delete(&key) {
-                tracing::warn!("could not delete a credential of a removed account: {error}");
-            }
+        // Mark first: from here on late events are dropped and finishing work re-purges.
+        self.events.removed().insert(account_id.clone());
+        let running = self.syncing().get(account_id).cloned().flatten();
+        if let Some(task) = running {
+            task.abort();
         }
-        self.tokens.invalidate(account_id);
-        // The id came from the store, so it is a plain path component.
-        match std::fs::remove_dir_all(self.bodies_root.join(account_id.as_str())) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!("could not delete cached bodies: {error}"),
+        if let Err(error) = self.store.delete_account(account_id) {
+            self.events.removed().remove(account_id);
+            return Err(error.into());
         }
+        self.purge(account_id);
         self.events.forget(account_id);
         self.events.emit(CoreEvent::AccountsChanged);
         Ok(())
     }
+}
+
+/// Re-uses the Microsoft account with this email (case-insensitive) or inserts a new one,
+/// then stores its tokens. A newly inserted row is deleted again if storing tokens fails.
+fn save_microsoft_account(
+    store: &Store,
+    email: String,
+    store_tokens: impl FnOnce(&AccountId) -> wbmc_core::Result<()>,
+) -> wbmc_core::Result<Account> {
+    let existing = store.accounts()?.into_iter().find(|account| {
+        account.kind == ProviderKind::Microsoft && account.email.eq_ignore_ascii_case(&email)
+    });
+    if let Some(account) = existing {
+        store_tokens(&account.id)?;
+        return Ok(account);
+    }
+    let account = Account {
+        id: AccountId::new(),
+        kind: ProviderKind::Microsoft,
+        display_name: email.clone(),
+        email,
+        config: serde_json::json!({}),
+    };
+    store.insert_account(&account)?;
+    if let Err(error) = store_tokens(&account.id) {
+        if let Err(cleanup) = store.delete_account(&account.id) {
+            tracing::warn!("could not roll back a new Microsoft account: {cleanup}");
+        }
+        return Err(error);
+    }
+    Ok(account)
 }
 
 fn parse_security(field: &str, value: &str) -> FfiResult<Security> {
@@ -711,6 +809,7 @@ impl WbmcCore {
         let events = Arc::new(EventBridge {
             listener,
             statuses: Mutex::new(HashMap::new()),
+            removed: Mutex::new(HashSet::new()),
         });
         // An unconfigured client id only matters once a Microsoft account is used.
         let client_id = microsoft::client_id().unwrap_or_default();
@@ -723,7 +822,7 @@ impl WbmcCore {
             secrets,
             tokens,
             events,
-            syncing: Mutex::new(HashSet::new()),
+            syncing: Mutex::new(HashMap::new()),
             runtime: runtime.handle().clone(),
         });
         Ok(Arc::new(Self {
@@ -737,7 +836,7 @@ impl WbmcCore {
     pub(crate) fn is_syncing(&self, account_id: &str) -> bool {
         self.inner
             .syncing()
-            .contains(&AccountId::from(account_id.to_string()))
+            .contains_key(&AccountId::from(account_id.to_string()))
     }
 }
 
@@ -824,8 +923,14 @@ impl WbmcCore {
         let Some(guard) = self.inner.try_begin_sync(&account_id) else {
             return Ok(());
         };
-        let inner = self.inner.clone();
-        self.inner.run(inner.sync_with(guard)).await
+        match self.inner.spawn_sync_task(guard).await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Err(not_found(format!(
+                "account {} was removed",
+                account_id.as_str()
+            ))),
+            Err(error) => Err(task_failed(error)),
+        }
     }
 
     /// Syncs every account concurrently. Per-account errors arrive as `SyncStatus` events.
@@ -839,7 +944,7 @@ impl WbmcCore {
                 let runs: Vec<_> = accounts
                     .iter()
                     .filter_map(|account| inner.try_begin_sync(&account.id))
-                    .map(|guard| inner.runtime.spawn(inner.clone().sync_with(guard)))
+                    .map(|guard| inner.spawn_sync_task(guard))
                     .collect();
                 for run in futures::future::join_all(runs).await {
                     match run {

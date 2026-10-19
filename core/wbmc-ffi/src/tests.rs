@@ -10,6 +10,7 @@ use wbmc_core::model::AccountId;
 use wbmc_core::secrets::{MemorySecrets, SecretStore, password_key, refresh_token_key};
 
 use super::*;
+use wbmc_core::store::Store;
 
 fn imap_tests_enabled() -> bool {
     matches!(std::env::var("WBMC_TEST_IMAP").as_deref(), Ok("1"))
@@ -310,4 +311,201 @@ fn inlines_cid_images_as_data_uris() {
         out,
         "<img src=\"data:image/png;base64,iVBORw0KGgo=\"><img src='data:image/png;base64,iVBORw0KGgo='><img src=\"cid:doc@x\"><img src=\"cid:missing\">"
     );
+}
+
+fn related_message(parts: &[(&str, &str, &[u8])]) -> Vec<u8> {
+    use base64::Engine as _;
+    let mut raw = String::from(
+        "From: a@example.com\r\nSubject: cid\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/related; boundary=\"b\"\r\n\r\n\
+         --b\r\nContent-Type: text/html\r\n\r\n<p>x</p>\r\n",
+    );
+    for (cid, mime, bytes) in parts {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        raw.push_str(&format!(
+            "--b\r\nContent-Type: {mime}\r\nContent-ID: <{cid}>\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n"
+        ));
+        for line in encoded.as_bytes().chunks(76) {
+            raw.push_str(std::str::from_utf8(line).unwrap());
+            raw.push_str("\r\n");
+        }
+    }
+    raw.push_str("--b--\r\n");
+    raw.into_bytes()
+}
+
+#[test]
+fn cid_inlining_has_a_total_budget_and_encodes_once() {
+    let big = vec![0xA5_u8; 1024 * 1024];
+    let small = vec![0x5A_u8; 16];
+    let raw = related_message(&[
+        ("big@x", "image/png", &big),
+        ("small@x", "image/gif", &small),
+    ]);
+    let mut html = "<img src=\"cid:big@x\">".repeat(1000);
+    html.push_str("<img src=\"cid:small@x\">");
+    let started = Instant::now();
+    let out = inline_cid_images(&html, &raw);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
+    // 10 MiB of 1 MiB images fit; every later reference (even a tiny image) stays cid:.
+    assert_eq!(out.matches("data:image/png;base64,").count(), 10);
+    assert_eq!(out.matches("src=\"cid:big@x\"").count(), 990);
+    assert!(out.contains("src=\"cid:small@x\""));
+    assert!(out.len() <= html::MAX_INLINE_TOTAL_BYTES * 4 / 3 + html.len() + 10 * 64);
+}
+
+#[test]
+fn cid_inlining_within_budget_inlines_distinct_images() {
+    let raw = related_message(&[
+        ("a@x", "image/png", b"aaaa"),
+        ("b@x", "image/svg+xml", b"<svg/>"),
+    ]);
+    let out = inline_cid_images("<img src=\"cid:a@x\"><img src=\"cid:b%40x\">", &raw);
+    assert!(!out.contains("cid:"), "{out}");
+    assert!(out.contains("data:image/svg+xml;base64,"));
+}
+
+#[test]
+fn only_plain_image_mime_types_are_safe() {
+    for ok in [
+        "image/png",
+        "image/svg+xml",
+        "image/vnd.microsoft.icon",
+        "image/x-icon",
+    ] {
+        assert!(html::is_safe_image_mime(ok), "{ok}");
+    }
+    for bad in [
+        "image/",
+        "image",
+        "text/html",
+        "IMAGE/PNG",
+        "image/png\"><script>",
+        "image/png;base64",
+        "image/png x",
+        "application/image/png",
+    ] {
+        assert!(!html::is_safe_image_mime(bad), "{bad}");
+    }
+}
+
+#[test]
+fn imap_input_debug_redacts_password() {
+    let debug = format!("{:?}", input("hunter2-secret"));
+    assert!(!debug.contains("hunter2-secret"), "{debug}");
+    assert!(debug.contains("<redacted>"));
+    assert!(debug.contains("alice@wbmc.test"));
+}
+
+#[test]
+fn new_microsoft_account_is_rolled_back_when_tokens_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("wbmc.sqlite")).unwrap();
+    let failed = save_microsoft_account(&store, "ms@example.com".into(), |_| {
+        Err(wbmc_core::CoreError::Storage("keychain locked".into()))
+    });
+    assert!(failed.is_err());
+    assert!(store.accounts().unwrap().is_empty());
+
+    let first = save_microsoft_account(&store, "ms@example.com".into(), |_| Ok(())).unwrap();
+    let again = save_microsoft_account(&store, "MS@example.com".into(), |_| Ok(())).unwrap();
+    assert_eq!(first.id, again.id);
+    // A failed re-sign-in keeps the existing account.
+    let failed_again = save_microsoft_account(&store, "ms@example.com".into(), |_| {
+        Err(wbmc_core::CoreError::Storage("keychain locked".into()))
+    });
+    assert!(failed_again.is_err());
+    assert_eq!(store.accounts().unwrap().len(), 1);
+}
+
+#[test]
+fn finishing_sync_of_removed_account_purges_residue() {
+    let h = harness();
+    let id = AccountId::new();
+    h.core.inner.syncing().insert(id.clone(), None);
+    let guard = SyncGuard {
+        inner: h.core.inner.clone(),
+        account_id: id.clone(),
+    };
+    h.core.inner.events.removed().insert(id.clone());
+    // Residue written by in-flight work after `remove_account` purged.
+    h.secrets.set(&password_key(&id), "pw").unwrap();
+    h.secrets.set(&refresh_token_key(&id), "rotated").unwrap();
+    let body_dir = h.dir.path().join("bodies").join(id.as_str());
+    std::fs::create_dir_all(&body_dir).unwrap();
+    std::fs::write(body_dir.join("m.eml"), b"x").unwrap();
+
+    drop(guard);
+
+    assert!(!body_dir.exists());
+    assert_eq!(h.secrets.get(&password_key(&id)).unwrap(), None);
+    assert_eq!(h.secrets.get(&refresh_token_key(&id)).unwrap(), None);
+    assert!(!h.core.is_syncing(id.as_str()));
+    // Removed accounts never start a new sync and their late events are dropped.
+    assert!(h.core.inner.try_begin_sync(&id).is_none());
+    h.core
+        .inner
+        .events
+        .emit(wbmc_core::events::CoreEvent::SyncStatus {
+            account_id: id.clone(),
+            status: wbmc_core::events::SyncStatus::Idle,
+        });
+    assert!(h.events.events().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_account_during_sync_leaves_no_residue() {
+    if !imap_tests_enabled() {
+        return;
+    }
+    let h = harness();
+    let account = h.core.add_imap_account(input("password")).await.unwrap();
+    let id = AccountId::from(account.id.clone());
+    let body_dir = h.dir.path().join("bodies").join(&account.id);
+    // Wait until the sync is prefetching bodies, then remove the account mid-flight.
+    let started = Instant::now();
+    while !body_dir.exists() {
+        assert!(
+            h.core.is_syncing(&account.id),
+            "sync ended before prefetch was seen"
+        );
+        assert!(started.elapsed() < Duration::from_secs(120));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    h.secrets.set(&refresh_token_key(&id), "token").unwrap();
+    h.core.remove_account(account.id.clone()).unwrap();
+    let removed_at = h
+        .events
+        .events()
+        .iter()
+        .rposition(|event| matches!(event, FfiEvent::AccountsChanged))
+        .unwrap();
+
+    wait_for_sync(&h.core, &account.id).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(!body_dir.exists(), "bodies re-created after removal");
+    assert_eq!(h.secrets.get(&password_key(&id)).unwrap(), None);
+    assert_eq!(h.secrets.get(&refresh_token_key(&id)).unwrap(), None);
+    assert!(h.core.accounts().is_empty());
+    let late: Vec<_> = h.events.events()[removed_at + 1..]
+        .iter()
+        .filter(|event| match event {
+            FfiEvent::SyncStatus { account_id, .. } | FfiEvent::FoldersChanged { account_id } => {
+                account_id == &account.id
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    assert!(late.is_empty(), "late events: {late:?}");
+    assert!(matches!(
+        h.core.sync_account(account.id.clone()).await,
+        Ok(()) | Err(FfiError::NotFound { .. })
+    ));
 }

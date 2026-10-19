@@ -2721,6 +2721,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
+ "mail-parser",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
