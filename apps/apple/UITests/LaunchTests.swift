@@ -8,6 +8,7 @@ final class LaunchTests: XCTestCase {
         let app = XCUIApplication()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("WBMC-UI-\(UUID().uuidString)")
         defer { app.terminate(); try? FileManager.default.removeItem(at: directory) }
+        app.launchArguments += ["-ApplePersistenceIgnoreState", "YES"]
         app.launchEnvironment["WBMC_SECRETS"] = "memory"
         app.launchEnvironment["WBMC_DATA_DIR"] = directory.path
         app.launch()

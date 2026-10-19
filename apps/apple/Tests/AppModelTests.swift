@@ -12,6 +12,7 @@ final class FakeCore: WbmcCoreProtocol, Sendable {
         var folderRequests: [String] = []
         var messageRequests: [(String, UInt32, UInt32)] = []
         var rowCount = 250
+        var unreadCount: UInt32 = 3
     }
     let state = Mutex(State())
     let contentProvider: @Sendable (String) async throws -> MessageContent
@@ -22,8 +23,13 @@ final class FakeCore: WbmcCoreProtocol, Sendable {
 
     func accounts() -> [AccountInfo] { state.withLock { $0.accounts } }
     func folders(accountId: String) -> [FolderInfo] {
-        state.withLock { $0.folderRequests.append(accountId) }
-        return [Self.folder("inbox", account: accountId), Self.folder("other", account: accountId)]
+        let unread = state.withLock { value in
+            value.folderRequests.append(accountId)
+            return value.unreadCount
+        }
+        var inbox = Self.folder("inbox", account: accountId)
+        inbox.unreadCount = unread
+        return [inbox, Self.folder("other", account: accountId)]
     }
     static func folder(_ id: String, account: String = "a") -> FolderInfo {
         FolderInfo(id: id, accountId: account, name: id, role: id == "inbox" ? "inbox" : "other",
@@ -80,7 +86,10 @@ struct AppModelTests {
         model.handle(.messagesChanged(folderId: "other"))
         #expect(core.state.withLock { $0.messageRequests.count } == before)
         #expect(core.state.withLock { $0.folderRequests.last } == "a")
+        core.state.withLock { $0.folderRequests = []; $0.unreadCount = 7 }
         model.handle(.messagesChanged(folderId: "inbox"))
+        #expect(core.state.withLock { $0.folderRequests } == ["a"])
+        #expect(model.folders["a"]?.first(where: { $0.id == "inbox" })?.unreadCount == 7)
         #expect(model.messages.count == 200)
         #expect(core.state.withLock { $0.messageRequests.last?.2 } == 200)
         #expect(model.selectedMessageID == "m4")
@@ -95,6 +104,22 @@ struct AppModelTests {
         #expect(model.accounts[0].status == "needs_sign_in")
         model.handle(.syncStatus(accountId: "a", status: .syncing(done: 1)))
         #expect(model.accounts[0].status == "syncing")
+        model.handle(.syncStatus(accountId: "a", status: .error(message: "Invalid IMAP credentials")))
+        #expect(model.accountErrors["a"] == "Invalid IMAP credentials")
+        model.handle(.syncStatus(accountId: "a", status: .idle))
+        #expect(model.accountErrors["a"] == nil)
+    }
+
+    @Test func onlyMicrosoftAccountsOfferSignInAgain() {
+        var account = FakeCore().accounts()[0]
+        account.status = "needs_sign_in"
+        #expect(Sidebar.offersSignInAgain(for: account))
+        account.kind = "imap"
+        #expect(!Sidebar.offersSignInAgain(for: account))
+        account.status = "error"
+        #expect(!Sidebar.offersSignInAgain(for: account))
+        account.kind = "microsoft"
+        #expect(!Sidebar.offersSignInAgain(for: account))
     }
 
     @Test func accountAndFolderEventsReloadOnlyTheirScope() {

@@ -15,6 +15,7 @@ final class AppModel {
     private(set) var isLoadingContent = false
     private(set) var canLoadMore = false
     var errorMessage: String?
+    private(set) var accountErrors: [String: String] = [:]
 
     let core: any CoreClient
     let signInStarter: any SignInStarter
@@ -28,6 +29,7 @@ final class AppModel {
 
     func load() {
         accounts = core.accounts()
+        accountErrors = accountErrors.filter { id, _ in accounts.contains(where: { $0.id == id }) }
         folders = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, core.folders(accountId: $0.id)) })
         validateFolderSelection()
     }
@@ -83,16 +85,27 @@ final class AppModel {
                 messages = core.messages(folderId: folderID, offset: 0, limit: count)
                 canLoadMore = messages.count == Int(count)
                 if let id = selectedMessageID, !messages.contains(where: { $0.id == id }) { clearMessage() }
-            } else if let accountID = folders.first(where: { $0.value.contains(where: { $0.id == folderID }) })?.key {
+            }
+            if let accountID = folders.first(where: { $0.value.contains(where: { $0.id == folderID }) })?.key {
                 folders[accountID] = core.folders(accountId: accountID)
             }
         case .syncStatus(let accountID, let status):
             guard let index = accounts.firstIndex(where: { $0.id == accountID }) else { return }
             switch status {
-            case .idle: accounts[index].status = "idle"
-            case .syncing: accounts[index].status = "syncing"
-            case .error: accounts[index].status = "error"
-            case .needsSignIn: accounts[index].status = "needs_sign_in"
+            case .idle:
+                accounts[index].status = "idle"
+                accountErrors[accountID] = nil
+            case .syncing:
+                accounts[index].status = "syncing"
+                accountErrors[accountID] = nil
+            case .error(let message):
+                accounts[index].status = "error"
+                accountErrors[accountID] = message
+            case .needsSignIn:
+                accounts[index].status = "needs_sign_in"
+                accountErrors[accountID] = accounts[index].kind == "microsoft"
+                    ? "Please sign in to this account again."
+                    : "Account credentials are unavailable. Check your account settings."
             }
         }
     }

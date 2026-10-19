@@ -47,8 +47,13 @@ struct Sidebar: View {
                         Spacer()
                         switch account.status {
                         case "syncing": ProgressView().controlSize(.small).accessibilityLabel("Syncing")
-                        case "error": Image(systemName: "exclamationmark.triangle").help("Sync failed. Refresh to try again.")
-                        case "needs_sign_in": Button("Sign in again", action: signInAgain).font(.caption)
+                        case "needs_sign_in" where Self.offersSignInAgain(for: account):
+                            Button("Sign in again", action: signInAgain).font(.caption)
+                        case "error", "needs_sign_in":
+                            Image(systemName: "exclamationmark.triangle")
+                                .help(model.accountErrors[account.id] ?? (account.status == "needs_sign_in"
+                                    ? "Account credentials are unavailable. Check your account settings."
+                                    : "Sync failed. Refresh to try again."))
                         default: EmptyView()
                         }
                     }
@@ -62,6 +67,10 @@ struct Sidebar: View {
             }
         }
         .navigationTitle("Mail")
+    }
+
+    static func offersSignInAgain(for account: AccountInfo) -> Bool {
+        account.kind == "microsoft" && account.status == "needs_sign_in"
     }
 
     private func symbol(for role: String) -> String {
