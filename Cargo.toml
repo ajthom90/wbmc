@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core/wbmc-core"]
+members = ["core/wbmc-core", "core/wbmc-ffi"]
 
 [workspace.package]
 edition = "2024"

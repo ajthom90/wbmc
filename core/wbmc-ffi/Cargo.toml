@@ -1,0 +1,31 @@
+[package]
+name = "wbmc-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "lib"]
+name = "wbmc_ffi"
+
+[features]
+debug-tools = []
+uniffi-cli = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi-cli"]
+
+[dependencies]
+base64 = "0.22.1"
+futures = "0.3.34"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1.44"
+uniffi = { version = "0.32", features = ["tokio"] }
+wbmc-core = { path = "../wbmc-core" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
