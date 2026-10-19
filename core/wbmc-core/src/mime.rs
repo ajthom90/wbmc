@@ -26,6 +26,7 @@ pub struct ParsedMessage {
 }
 
 const SNIPPET_MAX_CHARS: usize = 200;
+const SNIPPET_HTML_CAP_BYTES: usize = 64 * 1024;
 
 fn unknown_sender() -> Address {
     Address {
@@ -194,9 +195,22 @@ fn make_snippet(s: &str) -> String {
     out
 }
 
+/// Finds `</name` case-insensitively without allocating.
+fn find_close_tag(hay: &str, name: &str) -> Option<usize> {
+    let pat = format!("</{name}");
+    let (h, p) = (hay.as_bytes(), pat.as_bytes());
+    h.windows(p.len()).position(|w| w.eq_ignore_ascii_case(p))
+}
+
 /// Minimal tag stripper: drops tags, `<style>`/`<script>` contents and
 /// comments, then decodes a few basic entities.
 fn strip_html(html: &str) -> String {
+    // Only ~200 chars are needed for a snippet; cap input to bound work.
+    let mut end = html.len().min(SNIPPET_HTML_CAP_BYTES);
+    while !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    let html = &html[..end];
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     while let Some(lt) = rest.find('<') {
@@ -218,10 +232,12 @@ fn strip_html(html: &str) -> String {
             .collect::<String>()
             .to_ascii_lowercase();
         rest = &rest[gt + 1..];
-        if (name == "style" || name == "script") && !tag.trim_start().starts_with('/') {
-            let close = format!("</{name}");
-            let lower = rest.to_ascii_lowercase();
-            rest = match lower.find(&close) {
+        let self_closing = tag.trim_end().ends_with('/');
+        if (name == "style" || name == "script")
+            && !tag.trim_start().starts_with('/')
+            && !self_closing
+        {
+            rest = match find_close_tag(rest, &name) {
                 Some(i) => {
                     let after = &rest[i..];
                     after.find('>').map_or("", |g| &after[g + 1..])
@@ -345,6 +361,25 @@ mod tests {
         let m = parse_message(body.as_bytes(), FALLBACK);
         assert!(m.snippet.starts_with("a & b <c> \"d\" 'e' é"));
         assert_eq!(m.snippet.chars().count(), 200);
+    }
+
+    #[test]
+    fn hostile_html_snippet_is_fast() {
+        let html = format!("<p>Hello</p>{}", "<style>x</style>".repeat(131_072));
+        assert!(html.len() >= 2 * 1024 * 1024);
+        let body = format!(
+            "From: a@b.c\r\nSubject: s\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}"
+        );
+        let start = std::time::Instant::now();
+        let m = parse_message(body.as_bytes(), FALLBACK);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(m.snippet, "Hello");
+    }
+
+    #[test]
+    fn self_closing_script_does_not_swallow_content() {
+        let body = b"From: a@b.c\r\nContent-Type: text/html\r\n\r\n<script/><p>Kept</p><SCRIPT>x</SCRIPT>tail";
+        assert_eq!(parse_message(body, FALLBACK).snippet, "Kept tail");
     }
 
     #[test]
