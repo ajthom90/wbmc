@@ -223,11 +223,14 @@ private struct MailHTMLScanner {
             }
             let tagLimit = rawText.map { index < $0.end ? $0.end : bytes.count } ?? bytes.count
             guard let tag = tag(at: index, before: tagLimit) else {
-                if let raw = rawText {
-                    // Preserve incomplete tag-like raw text, and resume at
-                    // its closing tag. Skipping this already-scanned range
-                    // prevents repeated scans of the same unterminated value.
-                    if index < raw.end { index = raw.end; continue }
+                if rawText != nil {
+                    // A link/meta/base start inside raw text that doesn't end
+                    // before the raw closer may be a live element in foreign
+                    // content whose quoted value spans the closer. We can't
+                    // tell where the browser ends it, so fail closed: drop
+                    // everything from here to EOF.
+                    output.append(contentsOf: bytes[copiedThrough..<index])
+                    copiedThrough = bytes.count
                     break
                 }
                 // HTML does not emit a real tag left incomplete at EOF. Drop it

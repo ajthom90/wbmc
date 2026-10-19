@@ -220,11 +220,15 @@ struct SafeHTMLViewTests {
         #expect(SafeHTMLView.securedHTML(html) == SafeHTMLView.securityMetadata + "<style><!--<?bogus </style>")
     }
 
-    @Test func unterminatedTagLikeRawTextPreservesTheTail() {
-        let raw = #"<style>some <link href="unfinished</style><p>Keep</p>"#
-        #expect(SafeHTMLView.securedHTML(raw + "<link href=https://x>") == SafeHTMLView.securityMetadata + raw)
+    @Test func resourceTagSpanningRawTextCloserFailsClosed() {
+        let raw = #"<style>some <link href="unfinished</style><p>Gone</p>"#
+        #expect(SafeHTMLView.securedHTML(raw + "<link href=https://x>") == SafeHTMLView.securityMetadata + "<style>some ")
         let script = #"<script><meta content="unfinished"#
-        #expect(SafeHTMLView.securedHTML(script) == SafeHTMLView.securityMetadata + script)
+        #expect(SafeHTMLView.securedHTML(script) == SafeHTMLView.securityMetadata + "<script>")
+        let foreign = #"<svg><title><link rel=preconnect a="</title><!--" href=https://x>--><p>t</p>"#
+        let secured = SafeHTMLView.securedHTML(foreign)
+        #expect(!secured.contains("https://x"))
+        #expect(!secured.contains("<link"))
     }
 
     @Test func splitScriptClosingTextRemainsUnchanged() {
