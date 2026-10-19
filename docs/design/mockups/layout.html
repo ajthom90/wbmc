@@ -1,0 +1,104 @@
+<style>
+  .win{border-radius:10px;overflow:hidden;border:1px solid #d6d6db;background:#fff;font:12px -apple-system,Segoe UI,sans-serif;color:#1d1d1f;height:330px;display:flex;flex-direction:column;box-shadow:0 6px 24px rgba(0,0,0,.08)}
+  .bar{height:30px;background:#f3f3f5;border-bottom:1px solid #e3e3e7;display:flex;align-items:center;padding:0 10px;gap:6px}
+  .dot{width:10px;height:10px;border-radius:50%;background:#ff5f57}.dot:nth-child(2){background:#febc2e}.dot:nth-child(3){background:#28c840}
+  .search{margin-left:auto;margin-right:auto;width:45%;height:18px;border-radius:6px;background:#e7e7ea;color:#8a8a90;font-size:11px;display:flex;align-items:center;padding-left:8px}
+  .row{display:flex;flex:1;min-height:0}
+  .side{background:#f7f7f9;border-right:1px solid #ececf0;padding:10px 8px;color:#444}
+  .side div{padding:4px 6px;border-radius:5px;margin-bottom:2px;display:flex;justify-content:space-between}
+  .side .on{background:#e1e8ff;color:#2140c8;font-weight:600}
+  .side .hd{font-size:10px;text-transform:uppercase;color:#999;margin-top:8px}
+  .list{border-right:1px solid #ececf0;overflow:hidden}
+  .msg{padding:8px 10px;border-bottom:1px solid #f0f0f3}
+  .msg b{display:block;font-size:12px}.msg span{color:#6b6b72;font-size:11px;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .msg.sel{background:#eef2ff}
+  .unread b::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:#3b5bfd;margin-right:5px;vertical-align:middle}
+  .read{flex:1;padding:14px 18px;overflow:hidden}
+  .read h4{margin:0 0 4px;font-size:15px}.read .meta{color:#777;font-size:11px;margin-bottom:12px}
+  .read p{margin:0 0 8px;line-height:1.5;color:#333}
+  .pill{display:inline-block;padding:3px 9px;border-radius:12px;background:#f0f0f3;margin-right:4px;font-size:11px}
+  .card{background:#fff;border:1px solid #ececf0;border-radius:10px;padding:10px 12px;margin:0 0 8px}
+</style>
+
+<h2>Which main window feels right for WBMC?</h2>
+<p class="subtitle">Three layout directions. All would be customizable, but one has to be the default. Click to select, then tell me what you think in the terminal.</p>
+
+<div class="cards">
+  <div class="card" data-choice="three-pane" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="win">
+        <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><div class="search">Search all mail</div></div>
+        <div class="row">
+          <div class="side" style="width:120px">
+            <div class="on">Inbox <span>12</span></div><div>Calendar</div><div>Contacts</div>
+            <div class="hd">Work</div><div>Inbox</div><div>Sent</div><div>Projects</div>
+            <div class="hd">Personal</div><div>Inbox</div>
+          </div>
+          <div class="list" style="width:190px">
+            <div class="msg sel unread"><b>Dana Ruiz</b><span>Q4 budget review: numbers attached</span></div>
+            <div class="msg unread"><b>IT Helpdesk</b><span>Scheduled maintenance this Saturday</span></div>
+            <div class="msg"><b>Marcus Lee</b><span>Re: Lunch Thursday?</span></div>
+            <div class="msg"><b>GitHub</b><span>[wbmc] New issue opened</span></div>
+            <div class="msg"><b>Priya N.</b><span>Slides for Monday</span></div>
+          </div>
+          <div class="read">
+            <h4>Q4 budget review</h4><div class="meta">Dana Ruiz · to you · 9:41 AM</div>
+            <p>Hi! Attached are the Q4 numbers. Can we go over them Thursday before the leadership sync?</p>
+            <span class="pill">📎 Q4-budget.xlsx</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body"><h3>A · Refined three-pane</h3><p>Folders, list and message side by side. Instantly familiar to people coming from Outlook, just cleaner. Like Apple Mail or new Outlook done right.</p></div>
+  </div>
+
+  <div class="card" data-choice="focused" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="win">
+        <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><div class="search">⌘K  Search or run a command</div></div>
+        <div class="row">
+          <div class="side" style="width:38px;padding:10px 6px;text-align:center">
+            <div class="on" style="justify-content:center">✉︎</div><div style="justify-content:center">📅</div><div style="justify-content:center">👤</div>
+          </div>
+          <div class="list" style="width:240px">
+            <div style="padding:8px 10px;font-weight:600">Inbox <span style="color:#999;font-weight:400">· all accounts</span></div>
+            <div class="msg sel unread"><b>Dana Ruiz</b><span>Q4 budget review: numbers attached</span></div>
+            <div class="msg unread"><b>IT Helpdesk</b><span>Scheduled maintenance this Saturday</span></div>
+            <div class="msg"><b>Marcus Lee</b><span>Re: Lunch Thursday?</span></div>
+            <div class="msg"><b>GitHub</b><span>[wbmc] New issue opened</span></div>
+          </div>
+          <div class="read" style="padding:18px 28px">
+            <h4 style="font-size:17px">Q4 budget review</h4><div class="meta">Dana Ruiz · 9:41 AM</div>
+            <p>Hi! Attached are the Q4 numbers. Can we go over them Thursday before the leadership sync?</p>
+            <span class="pill">📎 Q4-budget.xlsx</span>
+            <div style="margin-top:14px"><span class="pill">R Reply</span><span class="pill">E Archive</span><span class="pill">H Snooze</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body"><h3>B · Focused, keyboard-first</h3><p>Slim icon rail, unified inbox and a roomy reading pane. Folders appear on demand. Feels like Superhuman or Mimestream: calm and fast.</p></div>
+  </div>
+
+  <div class="card" data-choice="cards" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="win">
+        <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><div class="search">Search</div></div>
+        <div class="row" style="background:#f6f6f8">
+          <div style="flex:1;padding:12px 18px;overflow:hidden">
+            <div style="font-weight:600;margin-bottom:8px">Needs you <span style="color:#999;font-weight:400">· 3</span></div>
+            <div class="card"><b>Dana Ruiz</b> · Q4 budget review<div style="color:#666;margin-top:3px">Can we go over them Thursday before the leadership sync?</div><div style="margin-top:6px"><span class="pill">Reply</span><span class="pill">📎 Q4-budget.xlsx</span></div></div>
+            <div class="card"><b>Marcus Lee</b> · Lunch Thursday?<div style="color:#666;margin-top:3px">Thai place at noon?</div></div>
+            <div style="font-weight:600;margin:10px 0 8px">Updates & newsletters <span style="color:#999;font-weight:400">· 14</span></div>
+            <div class="card" style="color:#666">IT Helpdesk, GitHub, LinkedIn, and 11 more</div>
+          </div>
+          <div style="width:150px;padding:12px;border-left:1px solid #ececf0;background:#fff">
+            <div style="font-weight:600;margin-bottom:8px">Today</div>
+            <div class="card" style="border-left:3px solid #3b5bfd">10:00 Standup</div>
+            <div class="card" style="border-left:3px solid #28a36a">12:00 Lunch</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body"><h3>C · Smart feed with agenda</h3><p>Mail is grouped by importance ("Needs you" first, with newsletters bundled) and today's calendar sits alongside. Like Spark or HEY. The biggest departure from Outlook.</p></div>
+  </div>
+</div>

@@ -1,0 +1,72 @@
+<style>
+  .w{border-radius:10px;overflow:hidden;font-size:11px;height:200px;display:flex;flex-direction:column;box-shadow:0 4px 18px rgba(0,0,0,.1);margin-bottom:10px}
+  .r{display:flex;flex:1;min-height:0}
+  .s{width:95px;padding:8px 6px}.s div{padding:3px 6px;border-radius:5px;margin-bottom:2px}
+  .l{width:150px}.m{padding:7px 9px}.m b{display:block}.m span{opacity:.65;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
+  .p{flex:1;padding:12px 14px}.p h4{margin:0 0 3px;font-size:13px}.p p{margin:8px 0 0;line-height:1.45}
+  .cap{font-size:11px;color:#888;margin:0 0 4px}
+  /* mac native */
+  .mac{background:#fff;color:#1d1d1f;font-family:-apple-system,sans-serif;border:1px solid #d9d9de}
+  .mac .t{height:24px;background:#ececee}
+  .mac .s{background:rgba(232,232,240,.85);backdrop-filter:blur(10px)}.mac .s .on{background:rgba(0,0,0,.08);font-weight:600}
+  .mac .l{border-right:1px solid #eee}.mac .sel{background:#0a84ff;color:#fff;border-radius:6px;margin:3px}
+  /* win native */
+  .win{background:#f3f3f3;color:#1b1b1b;font-family:"Segoe UI",sans-serif;border:1px solid #dcdcdc}
+  .win .t{height:24px;background:#eef1f6}
+  .win .s{background:#eef1f6}.win .s .on{background:#fff;border-left:3px solid #005fb8;font-weight:600}
+  .win .l{background:#fff;border-right:1px solid #e5e5e5}.win .sel{background:#e6f0fb}
+  .win .p{background:#fff}
+  /* signature light */
+  .sig{background:#fbfaf7;color:#22201c;font-family:"Inter",-apple-system,sans-serif;border:1px solid #e7e3da}
+  .sig .t{height:24px;background:#fbfaf7;border-bottom:1px solid #eee9df}
+  .sig .s{background:#f3efe7}.sig .s .on{background:#22201c;color:#fbfaf7;font-weight:600}
+  .sig .l{border-right:1px solid #eee9df}.sig .sel{background:#fff;box-shadow:inset 3px 0 0 #e8590c}
+  .sig .p h4{font-family:Georgia,serif;font-size:15px}
+  /* signature dark */
+  .sigd{background:#16171b;color:#e9e7e2;font-family:"Inter",-apple-system,sans-serif;border:1px solid #2a2b31}
+  .sigd .t{height:24px;background:#16171b;border-bottom:1px solid #26272d}
+  .sigd .s{background:#1d1e23}.sigd .s .on{background:#e8590c;color:#fff;font-weight:600}
+  .sigd .l{border-right:1px solid #26272d}.sigd .sel{background:#22232a;box-shadow:inset 3px 0 0 #e8590c}
+  .sigd .p h4{font-family:Georgia,serif;font-size:15px}
+</style>
+
+<h2>What should WBMC look like?</h2>
+<p class="subtitle">Same three-pane layout (A), two visual philosophies. Themes and accent colors would be customizable either way; this is about the default.</p>
+
+<div class="cards">
+  <div class="card" data-choice="native" onclick="toggleSelect(this)">
+    <div class="card-image" style="padding:10px">
+      <p class="cap">On a Mac</p>
+      <div class="w mac"><div class="t"></div><div class="r">
+        <div class="s"><div class="on">Inbox</div><div>Calendar</div><div>Contacts</div><div>Sent</div></div>
+        <div class="l"><div class="m sel"><b>Dana Ruiz</b><span>Q4 budget review</span></div><div class="m"><b>IT Helpdesk</b><span>Maintenance Saturday</span></div><div class="m"><b>Marcus Lee</b><span>Lunch Thursday?</span></div></div>
+        <div class="p"><h4>Q4 budget review</h4><div style="opacity:.6">Dana Ruiz · 9:41 AM</div><p>Can we go over the numbers Thursday?</p></div>
+      </div></div>
+      <p class="cap">On Windows 11</p>
+      <div class="w win"><div class="t"></div><div class="r">
+        <div class="s"><div class="on">Inbox</div><div>Calendar</div><div>Contacts</div><div>Sent</div></div>
+        <div class="l"><div class="m sel"><b>Dana Ruiz</b><span>Q4 budget review</span></div><div class="m"><b>IT Helpdesk</b><span>Maintenance Saturday</span></div><div class="m"><b>Marcus Lee</b><span>Lunch Thursday?</span></div></div>
+        <div class="p"><h4>Q4 budget review</h4><div style="opacity:.6">Dana Ruiz · 9:41 AM</div><p>Can we go over the numbers Thursday?</p></div>
+      </div></div>
+    </div>
+    <div class="card-body"><h3>1 · Looks native on each platform</h3><p>Follows Apple's design on Mac/iPhone and Microsoft's Fluent design on Windows. Feels like it "belongs" on every computer; the WBMC personality shows in details, not chrome.</p></div>
+  </div>
+
+  <div class="card" data-choice="signature" onclick="toggleSelect(this)">
+    <div class="card-image" style="padding:10px">
+      <p class="cap">Light</p>
+      <div class="w sig"><div class="t"></div><div class="r">
+        <div class="s"><div class="on">Inbox</div><div>Calendar</div><div>Contacts</div><div>Sent</div></div>
+        <div class="l"><div class="m sel"><b>Dana Ruiz</b><span>Q4 budget review</span></div><div class="m"><b>IT Helpdesk</b><span>Maintenance Saturday</span></div><div class="m"><b>Marcus Lee</b><span>Lunch Thursday?</span></div></div>
+        <div class="p"><h4>Q4 budget review</h4><div style="opacity:.6">Dana Ruiz · 9:41 AM</div><p>Can we go over the numbers Thursday?</p></div>
+      </div></div>
+      <p class="cap">Dark</p>
+      <div class="w sigd"><div class="t"></div><div class="r">
+        <div class="s"><div class="on">Inbox</div><div>Calendar</div><div>Contacts</div><div>Sent</div></div>
+        <div class="l"><div class="m sel"><b>Dana Ruiz</b><span>Q4 budget review</span></div><div class="m"><b>IT Helpdesk</b><span>Maintenance Saturday</span></div><div class="m"><b>Marcus Lee</b><span>Lunch Thursday?</span></div></div>
+        <div class="p"><h4>Q4 budget review</h4><div style="opacity:.6">Dana Ruiz · 9:41 AM</div><p>Can we go over the numbers Thursday?</p></div>
+      </div></div>
+    </div>
+    <div class="card-body"><h3>2 · A signature WBMC look everywhere</h3><p>Its own warm palette, typography and accent color, identical on Mac, Windows and Linux. Instantly recognizable as WBMC, and people switching computers see the same app.</p></div>
+  </div>
+</div>
