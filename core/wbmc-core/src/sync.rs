@@ -112,9 +112,9 @@ impl SyncEngine {
         }
         for (folder, remote) in &mut folders {
             if let Some(parent) = &remote.parent_remote_id {
-                folder.parent_id = Some(ids.get(parent).cloned().ok_or_else(|| {
-                    CoreError::Protocol(format!("missing parent folder {parent}"))
-                })?);
+                // Unlisted parents (such as Gmail's nonselectable container)
+                // leave their selectable children at the top level.
+                folder.parent_id = ids.get(parent).cloned();
                 *folder = self.store.upsert_folder(folder)?;
             }
         }
@@ -197,8 +197,12 @@ impl SyncEngine {
         inbox: &FolderId,
     ) -> Result<()> {
         for message in self.store.messages(inbox, 0, PAGE_SIZE)? {
-            if let Err(error) = self.body(account, provider, &message.id).await {
-                eprintln!("body prefetch failed for {}: {error}", message.id.as_str());
+            match self.body(account, provider, &message.id).await {
+                Err(error @ CoreError::NeedsSignIn { .. }) => return Err(error),
+                Err(error) => {
+                    eprintln!("body prefetch failed for {}: {error}", message.id.as_str());
+                }
+                Ok(_) => {}
             }
         }
         Ok(())
@@ -608,6 +612,50 @@ mod tests {
         assert_eq!(h.store.messages(&inbox.id, 0, 1).unwrap()[0].id, id);
         assert!(h.bodies.get(&h.account.id, &id).unwrap().is_some());
         assert_eq!(provider.provider_calls(), before + 3);
+    }
+
+    #[tokio::test]
+    async fn missing_parent_becomes_top_level() {
+        let h = Harness::new();
+        let mut child = remote_folder("[Gmail]/Sent Mail", FolderRole::Sent);
+        child.parent_remote_id = Some("[Gmail]".into());
+        let provider = FakeProvider::new(
+            vec![child],
+            HashMap::from([("[Gmail]/Sent Mail".into(), vec![remote_message(1)])]),
+        );
+
+        h.engine.sync_account(&h.account, &provider).await.unwrap();
+
+        let folder = h.folder("[Gmail]/Sent Mail");
+        assert_eq!(folder.parent_id, None);
+        assert_eq!(folder.total_count, 1);
+        assert_eq!(h.statuses().last(), Some(&SyncStatus::Idle));
+    }
+
+    #[tokio::test]
+    async fn prefetch_stops_on_needs_sign_in() {
+        let h = Harness::new();
+        let provider = provider(3, FolderRole::Inbox);
+        provider.set_auth_error_on_fetch(true);
+
+        let result = h.engine.sync_account(&h.account, &provider).await;
+
+        // One list call, one page, and exactly one fetch_raw attempt.
+        assert_eq!(provider.provider_calls(), 3);
+        assert!(matches!(result, Err(CoreError::NeedsSignIn { .. })));
+        assert_eq!(
+            h.statuses(),
+            vec![
+                SyncStatus::Syncing { done: 0 },
+                SyncStatus::Syncing { done: 3 },
+                SyncStatus::NeedsSignIn,
+            ]
+        );
+        let rows = h.store.messages(&h.folder("inbox").id, 0, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert!(h.bodies.get(&h.account.id, &row.id).unwrap().is_none());
+        }
     }
 
     #[tokio::test]

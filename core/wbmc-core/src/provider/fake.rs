@@ -22,6 +22,7 @@ struct FakeState {
     fail_after_pages: Option<u32>,
     reset_next: bool,
     auth_error: bool,
+    auth_error_on_fetch: bool,
     pages: u32,
     calls: u32,
 }
@@ -37,6 +38,7 @@ impl FakeProvider {
                 fail_after_pages: None,
                 reset_next: false,
                 auth_error: false,
+                auth_error_on_fetch: false,
                 pages: 0,
                 calls: 0,
             }),
@@ -61,6 +63,13 @@ impl FakeProvider {
 
     pub fn set_auth_error(&self, auth_error: bool) {
         self.state.lock().expect("fake state poisoned").auth_error = auth_error;
+    }
+
+    pub fn set_auth_error_on_fetch(&self, auth_error: bool) {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .auth_error_on_fetch = auth_error;
     }
 
     pub fn set_messages(&self, folder_remote_id: &str, messages: Vec<RemoteMessage>) {
@@ -147,6 +156,11 @@ impl MailProvider for FakeProvider {
 
     async fn fetch_raw(&self, folder_remote_id: &str, message_remote_id: &str) -> Result<Vec<u8>> {
         let state = self.begin_call()?;
+        if state.auth_error_on_fetch {
+            return Err(CoreError::NeedsSignIn {
+                account_id: "fake".into(),
+            });
+        }
         if state
             .fetch_errors
             .contains(&(folder_remote_id.into(), message_remote_id.into()))
