@@ -1,1 +1,6 @@
 .superpowers/
+target/
+*.xcframework
+apps/apple/*.xcodeproj
+apps/apple/WBMCCoreKit/Sources/WBMCCore/Generated/
+.DS_Store

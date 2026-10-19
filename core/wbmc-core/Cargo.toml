@@ -1,0 +1,10 @@
+[package]
+name = "wbmc-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+thiserror = "2.0.21"

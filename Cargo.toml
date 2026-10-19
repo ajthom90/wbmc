@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["core/wbmc-core"]
+
+[workspace.package]
+edition = "2024"
+license = "MPL-2.0"
