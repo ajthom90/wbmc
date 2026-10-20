@@ -149,14 +149,18 @@ struct AddAccount: View {
             switch state {
             case .email:
                 Button("Continue", action: continueFromEmail).keyboardShortcut(.defaultAction)
-            case .oauth(let provider, let providerName):
-                Button("Sign In") { signIn(provider: provider, providerName: providerName) }
+            case .oauth(let provider, _):
+                Button("Set Up Manually") {
+                    errorMessage = nil
+                    state.setUpManually(email: email)
+                }
+                Button("Sign In") { signIn(provider: provider) }
                     .keyboardShortcut(.defaultAction)
             case .appPassword, .password, .manual:
                 Button("Add Account", action: addAccount).keyboardShortcut(.defaultAction)
             case .unknown:
-                Button("Microsoft 365") { signIn(provider: "microsoft", providerName: "Microsoft") }
-                Button("Google") { signIn(provider: "google", providerName: "Google") }
+                Button("Microsoft 365") { signIn(provider: "microsoft") }
+                Button("Google") { signIn(provider: "google") }
                 Button("Other (IMAP)", action: showManual)
             case .detecting, .signingIn, .adding:
                 EmptyView()
@@ -215,9 +219,9 @@ struct AddAccount: View {
             smtpHost: smtpHost, smtpPort: UInt16(smtpPort) ?? 465, smtpSecurity: smtpSecurity))
     }
 
-    private func signIn(provider: String, providerName: String) {
+    private func signIn(provider: String) {
         errorMessage = nil
-        state = .signingIn
+        let previous = state.beginSignIn()
         accountTask?.cancel()
         accountTask = Task { @MainActor in
             do {
@@ -233,7 +237,7 @@ struct AddAccount: View {
             } catch {
                 if !Task.isCancelled {
                     errorMessage = friendlyError(error)
-                    state = .oauth(provider: provider, providerName: providerName)
+                    state.signInFailed(returningTo: previous)
                 }
             }
         }
@@ -288,8 +292,8 @@ struct AddAccount: View {
         didResume = true
         guard let resume, let request = Sidebar.signInAgain(for: resume) else { return }
         email = request.loginHint
-        let providerName = request.provider == "google" ? "Google" : "Microsoft"
-        signIn(provider: request.provider, providerName: providerName)
+        state = .oauth(provider: request.provider, providerName: request.provider == "google" ? "Google" : "Microsoft")
+        signIn(provider: request.provider)
     }
 
     private func cancel() {

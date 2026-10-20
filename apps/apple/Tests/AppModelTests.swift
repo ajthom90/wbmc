@@ -329,6 +329,16 @@ struct AppModelTests {
         #expect(AddAccountState.from(unknown, email: "ada@example.com") == .unknown(domain: "example.com"))
     }
 
+    @Test func oauthCanChooseAnotherProviderAndRecoverFromFailedSignIn() {
+        var state = AddAccountState.oauth(provider: "microsoft", providerName: "Microsoft")
+        state.setUpManually(email: "ada@example.com")
+        #expect(state == .unknown(domain: "example.com"))
+        let previous = state.beginSignIn()
+        #expect(state == .signingIn)
+        state.signInFailed(returningTo: previous)
+        #expect(state == .unknown(domain: "example.com"))
+    }
+
     @Test func detectionFailureFallsBackToUnknown() {
         #expect(AddAccountState.detectionFailure(email: "ada@example.com") == .unknown(domain: "example.com"))
     }

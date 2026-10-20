@@ -231,7 +231,7 @@ pub(crate) fn parse_config(xml: &str) -> Option<AccountSetup> {
     let built: Vec<Built> = servers.iter().filter_map(build_server).collect();
     let imap = best(built.iter().filter(|server| server.imap))?.clone();
     let smtp = best(built.iter().filter(|server| !server.imap))?.clone();
-    if !plain_allowed(&imap) || !plain_allowed(&smtp) {
+    if imap.security == Security::None || smtp.security == Security::None {
         tracing::debug!("autoconfig plain socket rejected");
         return None;
     }
@@ -337,10 +337,6 @@ fn best<'a>(servers: impl Iterator<Item = &'a Built>) -> Option<&'a Built> {
         Security::StartTls => 1,
         Security::None => 2,
     })
-}
-
-fn plain_allowed(server: &Built) -> bool {
-    server.security != Security::None || server.host.eq_ignore_ascii_case("localhost")
 }
 
 #[derive(Clone, Copy)]

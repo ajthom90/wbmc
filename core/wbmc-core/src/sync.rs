@@ -304,7 +304,14 @@ impl SyncEngine {
             }
         };
         let mut needs_sign_in = None;
-        for (message, (_remote_id, result)) in pending.iter().zip(fetched) {
+        let pending: std::collections::HashMap<_, _> = pending
+            .iter()
+            .map(|message| (message.remote_id.as_str(), message))
+            .collect();
+        for (remote_id, result) in fetched {
+            let Some(message) = pending.get(remote_id.as_str()) else {
+                continue;
+            };
             match result {
                 Ok(raw) => self.bodies.put(&account.id, &message.id, &raw)?,
                 Err(error @ CoreError::NeedsSignIn { .. }) => needs_sign_in = Some(error),
@@ -828,6 +835,24 @@ mod tests {
                 h.bodies.get(&h.account.id, &row.id).unwrap().is_some(),
                 "missing body for {}",
                 row.remote_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_matches_bodies_by_remote_id() {
+        let h = Harness::new();
+        let provider = provider(3, FolderRole::Inbox);
+        provider.set_reverse_prefetch(true);
+        h.engine.sync_account(&h.account, &provider).await.unwrap();
+        let rows = h.store.messages(&h.folder("inbox").id, 0, 200).unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            let raw = h.bodies.get(&h.account.id, &row.id).unwrap().unwrap();
+            assert!(
+                String::from_utf8(raw)
+                    .unwrap()
+                    .contains(&format!("Subject: Subject {}\r\n", row.remote_id))
             );
         }
     }

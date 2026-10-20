@@ -29,6 +29,8 @@ struct FakeState {
     auth_error_on_fetch: bool,
     /// `fetch_raw_many` waits forever. Prefetch must give up on its own deadline.
     hang_fetch_raw_many: bool,
+    #[cfg(test)]
+    reverse_prefetch: bool,
     pages: u32,
     calls: u32,
     fetch_raw_calls: u32,
@@ -50,6 +52,8 @@ impl FakeProvider {
                 auth_error: false,
                 auth_error_on_fetch: false,
                 hang_fetch_raw_many: false,
+                #[cfg(test)]
+                reverse_prefetch: false,
                 pages: 0,
                 calls: 0,
                 fetch_raw_calls: 0,
@@ -122,6 +126,14 @@ impl FakeProvider {
             .lock()
             .expect("fake state poisoned")
             .hang_fetch_raw_many = hang;
+    }
+
+    #[cfg(test)]
+    pub fn set_reverse_prefetch(&self, reverse: bool) {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .reverse_prefetch = reverse;
     }
 
     pub fn set_messages(&self, folder_remote_id: &str, messages: Vec<RemoteMessage>) {
@@ -257,10 +269,17 @@ impl MailProvider for FakeProvider {
                 })
                 .collect();
         }
-        message_remote_ids
+        let results = message_remote_ids
             .iter()
             .map(|id| (id.clone(), raw_message(&state, folder_remote_id, id)))
-            .collect()
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        let results = if state.reverse_prefetch {
+            results.into_iter().rev().collect()
+        } else {
+            results
+        };
+        results
     }
 }
 

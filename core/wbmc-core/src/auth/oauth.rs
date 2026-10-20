@@ -104,7 +104,6 @@ impl SignIn {
                 ("client_id", client.client_id.as_str()),
                 ("response_type", "code"),
                 ("redirect_uri", redirect_uri.as_str()),
-                ("response_mode", "query"),
                 ("scope", scope.as_str()),
                 ("state", state.as_str()),
                 ("code_challenge", pkce.challenge.as_str()),

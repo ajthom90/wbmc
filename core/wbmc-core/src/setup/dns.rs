@@ -2,7 +2,9 @@
 
 //! MX and SRV lookups. A lookup error is "no match", same as an empty answer.
 
+#[cfg(any(test, feature = "test-util"))]
 use std::collections::HashMap;
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -92,6 +94,7 @@ fn normalize_name(name: &Name) -> String {
 }
 
 /// Scripted resolver for tests. An unknown name is an empty answer, not an error.
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Default)]
 pub struct FakeResolver {
     mx: Mutex<HashMap<String, Vec<String>>>,
@@ -99,6 +102,7 @@ pub struct FakeResolver {
     calls: Mutex<Vec<String>>,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl FakeResolver {
     pub fn new() -> Self {
         Self::default()
@@ -133,6 +137,7 @@ impl FakeResolver {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 #[async_trait]
 impl Resolver for FakeResolver {
     async fn mx(&self, domain: &str) -> Result<Vec<String>> {

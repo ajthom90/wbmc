@@ -124,7 +124,10 @@ pub fn client_with(client_id: &str, endpoints: Endpoints) -> Result<OAuthClient>
         token_url: endpoints.token_url(),
         scopes: SCOPES.iter().map(|s| (*s).to_string()).collect(),
         redirect_host: "localhost",
-        extra_authorize_params: vec![("prompt".into(), "select_account".into())],
+        extra_authorize_params: vec![
+            ("prompt".into(), "select_account".into()),
+            ("response_mode".into(), "query".into()),
+        ],
     })
 }
 
@@ -247,6 +250,7 @@ mod tests {
         let q = query_map(&sign_in.url());
         assert_eq!(q["client_id"], "test-client");
         assert_eq!(q["response_type"], "code");
+        assert_eq!(q["response_mode"], "query");
         assert_eq!(
             q["redirect_uri"],
             format!(

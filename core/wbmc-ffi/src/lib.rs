@@ -523,7 +523,7 @@ impl Inner {
         }
         {
             let mut syncing = self.syncing();
-            if syncing.contains_key(account_id) {
+            if syncing.contains_key(account_id) || self.restart_after_store().contains(account_id) {
                 return None;
             }
             syncing.insert(account_id.clone(), None);
@@ -752,19 +752,14 @@ impl Inner {
 
     async fn add_imap_account(self: Arc<Self>, input: ImapAccountInput) -> FfiResult<AccountInfo> {
         let candidates = if input.username.trim().is_empty() {
-            match self.detect_setup(&input.email).await? {
+            let alternatives = match self.detect_setup(&input.email).await? {
                 AccountSetup::Imap {
                     username_alternatives,
                     ..
-                } => {
-                    let candidates = username_candidates(&username_alternatives);
-                    if candidates.is_empty() {
-                        return Err(invalid("username is required"));
-                    }
-                    candidates
-                }
-                _ => return Err(invalid("username is required")),
-            }
+                } => username_alternatives,
+                _ => Vec::new(),
+            };
+            imap_login_candidates(&input.email, &alternatives)
         } else {
             vec![input.username.trim().to_string()]
         };
@@ -828,14 +823,20 @@ impl Inner {
             let key = password_key(&account.id);
             let password = input.password;
             let saved = account.clone();
+            let signing_in = self.clone();
             blocking(move || {
-                secrets.set(&key, &password)?;
-                store.update_account(&saved)
+                signing_in.restart_after_store().insert(saved.id.clone());
+                signing_in.events.bump_generation(&saved.id);
+                let result = secrets
+                    .set(&key, &password)
+                    .and_then(|()| store.update_account(&saved));
+                if result.is_err() {
+                    signing_in.restart_after_store().remove(&saved.id);
+                }
+                result
             })
             .await?;
-            self.events.set_status(&account.id, "idle");
-            self.events.emit(CoreEvent::AccountsChanged);
-            self.spawn_sync(&account.id);
+            self.settle_after_sign_in(&account.id);
             return Ok(self.account_info(&account));
         }
         let config = serde_json::to_value(&config).map_err(|error| FfiError::Storage {
@@ -892,7 +893,7 @@ impl Inner {
         let events = Arc::clone(&self.events);
         let signing_in = Arc::clone(&self);
         let account = blocking(move || {
-            save_oauth_account(&store, kind, email, |id| {
+            save_oauth_account(&store, kind, email, &tokens, |id| {
                 // Bump before the write so an in-flight sync is stale before it
                 // can observe the new tokens. Hold restarts until `settle_after_sign_in`.
                 signing_in.restart_after_store().insert(id.clone());
@@ -973,6 +974,7 @@ fn save_oauth_account(
     store: &Store,
     kind: ProviderKind,
     email: String,
+    tokens: &wbmc_core::auth::TokenSet,
     store_tokens: impl FnOnce(&AccountId) -> wbmc_core::Result<()>,
 ) -> wbmc_core::Result<Account> {
     let existing = store
@@ -982,6 +984,15 @@ fn save_oauth_account(
     if let Some(account) = existing {
         store_tokens(&account.id)?;
         return Ok(account);
+    }
+    if tokens
+        .refresh_token
+        .as_deref()
+        .is_none_or(|token| token.is_empty())
+    {
+        return Err(CoreError::InvalidInput(
+            "The provider did not return a refresh token; please try signing in again.".into(),
+        ));
     }
     let account = Account {
         id: AccountId::new(),
@@ -1096,6 +1107,14 @@ fn security_name(security: Security) -> String {
         Security::None => "none",
     }
     .to_string()
+}
+
+fn imap_login_candidates(email: &str, alternatives: &[String]) -> Vec<String> {
+    let mut candidates = username_candidates(alternatives);
+    if candidates.is_empty() {
+        candidates.push(email.trim().to_string());
+    }
+    candidates
 }
 
 /// Real login names from core: trim, drop empties, dedupe, keep order.

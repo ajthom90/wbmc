@@ -34,6 +34,20 @@ enum AddAccountState: Equatable, Sendable {
         .unknown(domain: domain(of: email))
     }
 
+    mutating func setUpManually(email: String) {
+        self = .unknown(domain: Self.domain(of: email))
+    }
+
+    mutating func beginSignIn() -> AddAccountState {
+        let previous = self
+        self = .signingIn
+        return previous
+    }
+
+    mutating func signInFailed(returningTo previous: AddAccountState) {
+        self = previous
+    }
+
     private static func domain(of email: String) -> String {
         guard let at = email.lastIndex(of: "@") else { return email }
         let domain = email[email.index(after: at)...]

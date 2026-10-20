@@ -18,6 +18,7 @@ const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
 struct Entry {
     /// Cached access token and its expiry (epoch ms).
     token: Option<(String, i64)>,
+    stored_generation: u64,
     /// Held while refreshing so concurrent callers share one refresh.
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -82,48 +83,62 @@ impl TokenManager {
             .refresh_lock
             .clone();
         let _guard = refresh_lock.lock().await;
-        // Another caller may have refreshed while we waited.
-        if let Some(token) = self.fresh_cached(account_id) {
-            return Ok(token);
+        loop {
+            // Another caller may have refreshed or stored tokens while we waited.
+            if let Some(token) = self.fresh_cached(account_id) {
+                return Ok(token);
+            }
+            let needs_sign_in = || CoreError::NeedsSignIn {
+                account_id: account_id.as_str().to_string(),
+            };
+            let key = refresh_token_key(account_id);
+            let (generation, refresh_token) = {
+                let entries = self.entries();
+                let generation = entries
+                    .get(account_id)
+                    .expect("token entry")
+                    .stored_generation;
+                let refresh_token = self
+                    .secrets
+                    .get(&key)?
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(needs_sign_in)?;
+                (generation, refresh_token)
+            };
+            let result = refresh(client, &refresh_token).await;
+            let mut entries = self.entries();
+            let entry = entries.get_mut(account_id).expect("token entry");
+            if entry.stored_generation != generation {
+                // Interactive sign-in won the race. Re-read its tokens instead.
+                continue;
+            }
+            let tokens = result.map_err(|e| match e {
+                CoreError::NeedsSignIn { .. } => needs_sign_in(),
+                other => other,
+            })?;
+            // Serialize persistence and caching with `store`'s generation bump.
+            if let Some(rotated) = tokens.refresh_token.as_deref()
+                && rotated != refresh_token
+            {
+                self.secrets.set(&key, rotated)?;
+            }
+            entry.token = Some((tokens.access_token.clone(), tokens.expires_at_ms));
+            return Ok(tokens.access_token);
         }
-
-        let needs_sign_in = || CoreError::NeedsSignIn {
-            account_id: account_id.as_str().to_string(),
-        };
-        let key = refresh_token_key(account_id);
-        let refresh_token = self
-            .secrets
-            .get(&key)?
-            .filter(|t| !t.is_empty())
-            .ok_or_else(needs_sign_in)?;
-        let tokens = refresh(client, &refresh_token).await.map_err(|e| match e {
-            CoreError::NeedsSignIn { .. } => needs_sign_in(),
-            other => other,
-        })?;
-        // Persist the rotated refresh token before handing out the new access token.
-        if let Some(rotated) = tokens.refresh_token.as_deref()
-            && rotated != refresh_token
-        {
-            self.secrets.set(&key, rotated)?;
-        }
-        self.cache(account_id, &tokens);
-        Ok(tokens.access_token)
     }
 
     /// Stores freshly issued tokens (e.g. after interactive sign-in): the refresh token
     /// goes to the secret store, the access token to the in-memory cache.
     pub fn store(&self, account_id: &AccountId, tokens: &TokenSet) -> Result<()> {
+        let mut entries = self.entries();
+        let entry = entries.entry(account_id.clone()).or_default();
         if let Some(refresh_token) = tokens.refresh_token.as_deref() {
             self.secrets
                 .set(&refresh_token_key(account_id), refresh_token)?;
         }
-        self.cache(account_id, tokens);
+        entry.stored_generation = entry.stored_generation.wrapping_add(1);
+        entry.token = Some((tokens.access_token.clone(), tokens.expires_at_ms));
         Ok(())
-    }
-
-    fn cache(&self, account_id: &AccountId, tokens: &TokenSet) {
-        self.entries().entry(account_id.clone()).or_default().token =
-            Some((tokens.access_token.clone(), tokens.expires_at_ms));
     }
 
     /// Drops the cached access token so the next call refreshes.
@@ -271,6 +286,63 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("rt-rotated")
+        );
+    }
+
+    #[tokio::test]
+    async fn store_during_refresh_keeps_new_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/common/oauth2/v2.0/token"))
+            .and(body_string_contains("refresh_token=old-refresh"))
+            .respond_with(
+                token_response("stale-access", "stale-rotation")
+                    .set_delay(std::time::Duration::from_secs(1)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let secrets = Arc::new(MemorySecrets::new());
+        let account = AccountId::from("acct".to_string());
+        secrets
+            .set(&refresh_token_key(&account), "old-refresh")
+            .unwrap();
+        let tm = Arc::new(manager(&server, secrets.clone()));
+        let refresh = {
+            let tm = tm.clone();
+            let account = account.clone();
+            tokio::spawn(async move { tm.access_token(&account, ProviderKind::Microsoft).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while server.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!refresh.is_finished());
+        tm.store(
+            &account,
+            &TokenSet {
+                access_token: "new-access".into(),
+                refresh_token: Some("new-refresh".into()),
+                expires_at_ms: now_ms() + 3_600_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(refresh.await.unwrap().unwrap(), "new-access");
+        assert_eq!(
+            secrets
+                .get(&refresh_token_key(&account))
+                .unwrap()
+                .as_deref(),
+            Some("new-refresh")
+        );
+        assert_eq!(
+            tm.access_token(&account, ProviderKind::Microsoft)
+                .await
+                .unwrap(),
+            "new-access"
         );
     }
 

@@ -191,6 +191,9 @@ async fn re_add_updates_settings() {
     let first = h.core.add_imap_account(input("password")).await.unwrap();
     wait_for_sync(&h.core, &first.id).await;
 
+    let id = AccountId::from(first.id.clone());
+    let guard = h.core.inner.try_begin_sync(&id).expect("old password sync");
+    let generation = h.core.inner.events.generation(&id);
     let mut again = input("password");
     again.smtp_port = 2525;
     again.display_name = "Renamed".into();
@@ -203,6 +206,15 @@ async fn re_add_updates_settings() {
     assert_eq!(stored[0].id.as_str(), first.id);
     assert_eq!(stored[0].display_name, "Renamed");
     assert_eq!(stored[0].config["smtp_port"], 2525);
+    assert!(h.core.inner.events.generation(&id) > generation);
+    assert!(h.core.inner.events.sync_is_stale(&id));
+    assert!(!h.core.inner.restart_after_store().contains(&id));
+    h.core.inner.events.emit(CoreEvent::SyncStatus {
+        account_id: id,
+        status: SyncStatus::NeedsSignIn,
+    });
+    assert_eq!(h.core.accounts()[0].status, "idle");
+    drop(guard);
     wait_for_sync(&h.core, &first.id).await;
 }
 
@@ -326,14 +338,6 @@ async fn invalid_imap_input_is_rejected_without_network() {
     bad.port = 0;
     assert!(matches!(
         h.core.add_imap_account(bad).await,
-        Err(FfiError::InvalidInput { .. })
-    ));
-    // An empty username only substitutes alternatives for an IMAP profile.
-    let mut oauth = input("password");
-    oauth.email = "person@gmail.com".into();
-    oauth.username.clear();
-    assert!(matches!(
-        h.core.add_imap_account(oauth).await,
         Err(FfiError::InvalidInput { .. })
     ));
     assert!(h.core.accounts().is_empty());
@@ -477,6 +481,64 @@ fn imap_input_debug_redacts_password() {
 }
 
 #[test]
+fn sync_cannot_begin_until_credentials_are_stored() {
+    let h = harness();
+    let id = AccountId::new();
+    h.core.inner.restart_after_store().insert(id.clone());
+    h.core.inner.events.bump_generation(&id);
+    assert!(h.core.inner.try_begin_sync(&id).is_none());
+    assert!(!h.core.is_syncing(id.as_str()));
+    h.core.inner.restart_after_store().remove(&id);
+    let guard = h.core.inner.try_begin_sync(&id).expect("sync after store");
+    drop(guard);
+}
+
+#[test]
+fn new_oauth_account_requires_refresh_token_but_resign_in_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("wbmc.sqlite")).unwrap();
+    let secrets = Arc::new(MemorySecrets::new());
+    let manager = TokenManager::new(secrets.clone(), HashMap::new());
+    for kind in [ProviderKind::Microsoft, ProviderKind::Google] {
+        let mut tokens = wbmc_core::auth::TokenSet {
+            access_token: "access".into(),
+            refresh_token: None,
+            expires_at_ms: i64::MAX,
+        };
+        let email = format!("{}@example.com", kind.as_str());
+        for refresh_token in [None, Some(String::new())] {
+            tokens.refresh_token = refresh_token;
+            let error = save_oauth_account(&store, kind, email.clone(), &tokens, |_| {
+                panic!("must not store tokens")
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, CoreError::InvalidInput(message) if message == "The provider did not return a refresh token; please try signing in again.")
+            );
+            assert!(!store.accounts().unwrap().iter().any(|a| a.kind == kind));
+        }
+        tokens.refresh_token = Some("stored-refresh".into());
+        let first = save_oauth_account(&store, kind, email.clone(), &tokens, |id| {
+            manager.store(id, &tokens)
+        })
+        .unwrap();
+        tokens.refresh_token = None;
+        let again = save_oauth_account(&store, kind, email.to_uppercase(), &tokens, |id| {
+            manager.store(id, &tokens)
+        })
+        .unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(
+            secrets
+                .get(&refresh_token_key(&first.id))
+                .unwrap()
+                .as_deref(),
+            Some("stored-refresh")
+        );
+    }
+}
+
+#[test]
 fn new_microsoft_account_is_rolled_back_when_tokens_fail() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("wbmc.sqlite")).unwrap();
@@ -484,6 +546,11 @@ fn new_microsoft_account_is_rolled_back_when_tokens_fail() {
         &store,
         wbmc_core::model::ProviderKind::Microsoft,
         "ms@example.com".into(),
+        &wbmc_core::auth::TokenSet {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at_ms: i64::MAX,
+        },
         |_| Err(wbmc_core::CoreError::Storage("keychain locked".into())),
     );
     assert!(failed.is_err());
@@ -493,6 +560,11 @@ fn new_microsoft_account_is_rolled_back_when_tokens_fail() {
         &store,
         wbmc_core::model::ProviderKind::Microsoft,
         "ms@example.com".into(),
+        &wbmc_core::auth::TokenSet {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at_ms: i64::MAX,
+        },
         |_| Ok(()),
     )
     .unwrap();
@@ -500,6 +572,11 @@ fn new_microsoft_account_is_rolled_back_when_tokens_fail() {
         &store,
         wbmc_core::model::ProviderKind::Microsoft,
         "MS@example.com".into(),
+        &wbmc_core::auth::TokenSet {
+            access_token: "access".into(),
+            refresh_token: None,
+            expires_at_ms: i64::MAX,
+        },
         |_| Ok(()),
     )
     .unwrap();
@@ -509,6 +586,11 @@ fn new_microsoft_account_is_rolled_back_when_tokens_fail() {
         &store,
         wbmc_core::model::ProviderKind::Microsoft,
         "ms@example.com".into(),
+        &wbmc_core::auth::TokenSet {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at_ms: i64::MAX,
+        },
         |_| Err(wbmc_core::CoreError::Storage("keychain locked".into())),
     );
     assert!(failed_again.is_err());
@@ -605,6 +687,12 @@ async fn remove_account_during_sync_leaves_no_residue() {
 #[tokio::test]
 async fn detect_account_maps_profile() {
     let h = harness();
+    h.core.set_detect_env(DetectEnv::for_test(
+        Arc::new(wbmc_core::setup::FakeResolver::new()),
+        "",
+        Duration::from_millis(200),
+        [String::new(), String::new()],
+    ));
     let setup = h.core.detect_account("x@wbmc.test".into()).await.unwrap();
     assert_eq!(setup.kind, "imap");
     assert_eq!(setup.provider_name, "WBMC Test");
@@ -623,20 +711,16 @@ async fn detect_account_maps_profile() {
 #[tokio::test]
 async fn detect_account_uses_injected_env() {
     let h = harness();
-    let server = wiremock::MockServer::start().await;
-    let base = server.uri();
-    h.core.set_detect_env(wbmc_core::setup::DetectEnv {
-        resolver: std::sync::Arc::new(wbmc_core::setup::FakeResolver::new()),
-        http: reqwest::Client::builder().build().unwrap(),
-        allow_http: true,
-        ispdb_base: base.clone(),
-        realm_base: base.clone(),
-        deadline: Duration::from_millis(200),
-        autoconfig_url_templates: [
+    let base = "";
+    h.core.set_detect_env(wbmc_core::setup::DetectEnv::for_test(
+        std::sync::Arc::new(wbmc_core::setup::FakeResolver::new()),
+        base,
+        Duration::from_millis(200),
+        [
             format!("{base}/autoconfig.{{domain}}"),
             format!("{base}/well-known.{{domain}}"),
         ],
-    });
+    ));
     let setup = h
         .core
         .detect_account("a@unknown.example".into())
@@ -645,6 +729,20 @@ async fn detect_account_uses_injected_env() {
     assert_eq!(setup.kind, "unknown");
     assert!(setup.imap.is_none());
     assert!(h.core.accounts().is_empty());
+}
+
+#[test]
+fn imap_login_falls_back_to_email_without_alternatives() {
+    for alternatives in [vec![], vec![" ".into()]] {
+        assert_eq!(
+            imap_login_candidates(" ada@example.com ", &alternatives),
+            ["ada@example.com"]
+        );
+    }
+    assert_eq!(
+        imap_login_candidates("ada@example.com", &["ada".into(), "ada@example.com".into()]),
+        ["ada", "ada@example.com"]
+    );
 }
 
 #[test]

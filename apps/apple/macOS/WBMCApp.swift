@@ -51,7 +51,7 @@ struct WBMCApp: App {
                 Button("Copy refresh token…") {
                     NotificationCenter.default.post(name: .copyRefreshToken, object: nil)
                 }
-                .disabled(model?.accounts.contains(where: { $0.kind == "microsoft" }) != true)
+                .disabled(model?.accounts.contains(where: { $0.kind == "microsoft" || $0.kind == "google" }) != true)
             }
         }
         #endif
@@ -113,13 +113,13 @@ private struct RefreshTokenSheet: View {
     @State private var confirming = false
     @State private var errorMessage: String?
 
-    private var microsoftAccounts: [AccountInfo] { model.accounts.filter { $0.kind == "microsoft" } }
+    private var oauthAccounts: [AccountInfo] { model.accounts.filter { $0.kind == "microsoft" || $0.kind == "google" } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Copy refresh token…").font(.title2)
-            Picker("Microsoft account", selection: $accountID) {
-                ForEach(microsoftAccounts, id: \.id) { Text($0.email).tag($0.id) }
+            Picker("Account", selection: $accountID) {
+                ForEach(oauthAccounts, id: \.id) { Text($0.email).tag($0.id) }
             }
             if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
             HStack {
@@ -129,7 +129,7 @@ private struct RefreshTokenSheet: View {
             }
         }
         .padding(24).frame(width: 440)
-        .onAppear { accountID = microsoftAccounts.first?.id ?? "" }
+        .onAppear { accountID = oauthAccounts.first?.id ?? "" }
         .alert("Copy a secret to the clipboard?", isPresented: $confirming) {
             Button("Cancel", role: .cancel) {}
             Button("Copy Token") { copyToken() }

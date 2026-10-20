@@ -23,7 +23,9 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::provider::ImapConfig;
 use crate::{CoreError, Result};
 
-pub use dns::{FakeResolver, HickoryResolver, Resolver};
+#[cfg(any(test, feature = "test-util"))]
+pub use dns::FakeResolver;
+pub use dns::{HickoryResolver, Resolver};
 pub use profiles::BundledImap;
 
 const ISPDB_BASE: &str = "https://autoconfig.thunderbird.net/v1.1";
@@ -54,15 +56,36 @@ pub enum AccountSetup {
 /// never fetches `http://`. The client does not follow redirects.
 pub struct DetectEnv {
     pub resolver: Arc<dyn Resolver>,
-    pub http: reqwest::Client,
-    pub allow_http: bool,
+    pub(crate) http: reqwest::Client,
+    pub(crate) allow_http: bool,
     pub ispdb_base: String,
     pub realm_base: String,
     pub deadline: Duration,
-    pub autoconfig_url_templates: [String; 2],
+    pub(crate) autoconfig_url_templates: [String; 2],
 }
 
 impl DetectEnv {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_test(
+        resolver: Arc<dyn Resolver>,
+        base: &str,
+        deadline: Duration,
+        autoconfig_url_templates: [String; 2],
+    ) -> Self {
+        Self {
+            resolver,
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("test HTTP client"),
+            allow_http: true,
+            ispdb_base: base.to_string(),
+            realm_base: base.to_string(),
+            deadline,
+            autoconfig_url_templates,
+        }
+    }
+
     /// System DNS, Thunderbird ISPDB, Microsoft user-realm, and an 8 second deadline.
     /// Redirects are not followed, and `http://` URLs are not fetched.
     pub fn system() -> Result<Self> {
@@ -162,7 +185,14 @@ fn invalid_address() -> CoreError {
 }
 
 pub(crate) fn is_hostname(domain: &str) -> bool {
-    if domain.is_empty() || domain.len() > 253 {
+    if domain.is_empty()
+        || domain.len() > 253
+        || domain.parse::<std::net::IpAddr>().is_ok()
+        || domain
+            .rsplit('.')
+            .next()
+            .is_some_and(|label| label.bytes().all(|b| b.is_ascii_digit()))
+    {
         return false;
     }
     domain.split('.').all(|label| {
@@ -319,6 +349,64 @@ mod tests {
         assert!(lab.resolver.calls().is_empty());
         let requests = lab.server.received_requests().await.unwrap();
         assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn autoconfig_rejects_ip_and_numeric_last_labels() {
+        for host in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "mail.123",
+            "127.1",
+            "2130706433",
+        ] {
+            assert!(!is_hostname(host), "{host}");
+            assert!(
+                autoconfig::parse_config(&autoconfig_document(host, "smtp.example.com")).is_none(),
+                "{host}"
+            );
+            assert!(
+                autoconfig::parse_config(&autoconfig_document("imap.example.com", host)).is_none(),
+                "{host}"
+            );
+        }
+        assert!(is_hostname("localhost"));
+        assert!(is_hostname("imap.example.com"));
+    }
+
+    #[test]
+    fn autoconfig_rejects_plain_even_on_localhost() {
+        let xml = autoconfig_document("localhost", "localhost");
+        assert!(autoconfig::parse_config(&xml).is_some());
+        for xml in [
+            xml.replace("SSL", "plain"),
+            xml.replace("STARTTLS", "plain"),
+            xml.replace("SSL", "plain").replace("STARTTLS", "plain"),
+        ] {
+            assert!(autoconfig::parse_config(&xml).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn bundled_localhost_plain_bypasses_autoconfig() {
+        let resolver = Arc::new(FakeResolver::new());
+        let env = DetectEnv::for_test(
+            resolver.clone(),
+            "http://localhost",
+            Duration::from_millis(1),
+            [String::new(), String::new()],
+        );
+        let AccountSetup::Imap { config, .. } = detect("ada@wbmc.test", &env).await.unwrap() else {
+            panic!("expected bundled IMAP profile");
+        };
+        assert_eq!(config.host, "localhost");
+        assert_eq!(config.security, Security::None);
+        assert_eq!(config.smtp_security, Security::None);
+        assert_eq!(config.username, "ada@wbmc.test");
+        assert!(resolver.calls().is_empty());
     }
 
     #[test]

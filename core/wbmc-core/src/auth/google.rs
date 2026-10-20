@@ -125,6 +125,7 @@ mod tests {
         let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(url.as_str().split('?').next().unwrap(), AUTHORIZE_URL);
         assert_eq!(q["access_type"], "offline");
+        assert!(!q.contains_key("response_mode"));
         assert_eq!(q["prompt"], "consent");
         assert_eq!(q["login_hint"], "a@example.com");
         assert_eq!(q["code_challenge_method"], "S256");
