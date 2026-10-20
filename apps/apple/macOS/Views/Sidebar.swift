@@ -29,11 +29,16 @@ struct FolderNode: Identifiable {
 
 struct Sidebar: View {
     let model: AppModel
-    let signInAgain: () -> Void
+    let signInAgain: (AccountInfo) -> Void
     @State private var accountPendingRemoval: (id: String, email: String)?
 
     var body: some View {
         List(selection: Binding(get: { model.selectedFolderID }, set: { model.select(folder: $0) })) {
+            if model.showsUnifiedInbox {
+                Label("All Inboxes", systemImage: "tray.2")
+                    .badge(model.unifiedUnreadCount)
+                    .tag(AppModel.unifiedInboxID)
+            }
             ForEach(model.accounts, id: \.id) { account in
                 Section {
                     OutlineGroup(FolderNode.tree(model.folders[account.id] ?? []), children: \.children) { node in
@@ -49,11 +54,11 @@ struct Sidebar: View {
                         switch account.status {
                         case "syncing": ProgressView().controlSize(.small).accessibilityLabel("Syncing")
                         case "needs_sign_in" where Self.offersSignInAgain(for: account):
-                            Button("Sign in again", action: signInAgain).font(.caption)
+                            Button("Sign in again") { signInAgain(account) }.font(.caption)
                         case "error", "needs_sign_in":
                             Image(systemName: "exclamationmark.triangle")
                                 .help(model.accountErrors[account.id] ?? (account.status == "needs_sign_in"
-                                    ? "Sign-in failed. Add the account again with the new password to update it."
+                                    ? needsSignInMessage(kind: account.kind)
                                     : "Sync failed. Refresh to try again."))
                         default: EmptyView()
                         }
@@ -93,7 +98,12 @@ struct Sidebar: View {
     }
 
     static func offersSignInAgain(for account: AccountInfo) -> Bool {
-        account.kind == "microsoft" && account.status == "needs_sign_in"
+        (account.kind == "microsoft" || account.kind == "google") && account.status == "needs_sign_in"
+    }
+
+    static func signInAgain(for account: AccountInfo) -> (provider: String, loginHint: String)? {
+        guard offersSignInAgain(for: account) else { return nil }
+        return (provider: account.kind, loginHint: account.email)
     }
 
     private func symbol(for role: String) -> String {

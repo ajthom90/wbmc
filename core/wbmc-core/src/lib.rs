@@ -7,6 +7,7 @@ pub mod mime;
 pub mod model;
 pub mod provider;
 pub mod secrets;
+pub mod setup;
 pub mod store;
 pub mod sync;
 

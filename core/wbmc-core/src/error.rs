@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 /// Errors surfaced by the WBMC core to every frontend.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum CoreError {
     #[error("network error: {0}")]
     Network(String),

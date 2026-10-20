@@ -11,7 +11,7 @@ struct MessageList: View {
             Task { await model.select(message: id) }
         })) {
             ForEach(model.messages, id: \.id) { message in
-                MessageListRow(message: message)
+                MessageListRow(message: message, accountEmail: accountEmail(for: message))
                     .tag(message.id)
                     .onAppear {
                         if message.id == model.messages.last?.id { model.loadMore() }
@@ -24,18 +24,47 @@ struct MessageList: View {
                                        systemImage: "tray", description: Text("Your synced mail appears here."))
             }
         }
-        .navigationTitle(model.folders.values.joined().first(where: { $0.id == model.selectedFolderID })?.name ?? "Messages")
+        .navigationTitle(navigationTitle)
     }
+
+    private var navigationTitle: String {
+        if model.selectedFolderID == AppModel.unifiedInboxID { return "All Inboxes" }
+        return model.folders.values.joined().first { $0.id == model.selectedFolderID }?.name ?? "Messages"
+    }
+
+    private func accountEmail(for message: MessageRow) -> String? {
+        guard model.selectedFolderID == AppModel.unifiedInboxID else { return nil }
+        return model.accounts.first { $0.id == message.accountId }?.email ?? message.accountId
+    }
+}
+
+func accountHueDegrees(accountId: String) -> Int {
+    var hash: UInt64 = 14_695_981_039_346_656_037
+    for byte in accountId.utf8 {
+        hash ^= UInt64(byte)
+        hash &*= 1_099_511_628_211
+    }
+    return Int(hash % 360)
 }
 
 private struct MessageListRow: View {
     let message: MessageRow
+    var accountEmail: String?
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             Circle().fill(message.isRead ? Color.clear : Color.accentColor)
                 .frame(width: 6, height: 6).padding(.top, 6)
                 .accessibilityLabel(message.isRead ? "Read" : "Unread")
+            if let accountEmail {
+                Circle()
+                    .fill(Color(hue: Double(accountHueDegrees(accountId: message.accountId)) / 360,
+                                saturation: 0.65, brightness: 0.85))
+                    .frame(width: 8, height: 8)
+                    .padding(.top, 5)
+                    .help(accountEmail)
+                    .accessibilityLabel(accountEmail)
+            }
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(message.fromName.isEmpty ? message.fromEmail : message.fromName)

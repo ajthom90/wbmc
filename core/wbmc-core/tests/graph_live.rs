@@ -7,11 +7,12 @@
 //! to `WBMC_TEST_M365_USER`. The public client id is read from
 //! `config/oauth-clients.toml`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use wbmc_core::auth::{TokenManager, microsoft};
-use wbmc_core::model::{AccountId, FolderRole};
+use wbmc_core::model::{AccountId, FolderRole, ProviderKind};
 use wbmc_core::provider::{GraphProvider, MailProvider};
 use wbmc_core::secrets::{MemorySecrets, SecretStore, refresh_token_key};
 
@@ -36,9 +37,15 @@ async fn graph_live_lists_inbox_and_fetches_one_body() {
     secrets
         .set(&refresh_token_key(&account), &refresh)
         .expect("store refresh token");
-    let tokens = Arc::new(TokenManager::new(secrets, client_id));
+    let tokens = Arc::new(TokenManager::new(
+        secrets,
+        HashMap::from([(
+            ProviderKind::Microsoft,
+            microsoft::client().expect("configured Microsoft client"),
+        )]),
+    ));
     let access = tokens
-        .access_token(&account)
+        .access_token(&account, ProviderKind::Microsoft)
         .await
         .expect("refresh access token");
     assert_test_user(&access, &user).await;

@@ -1,6 +1,8 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import AppKit
+import Network
+import Synchronization
 import Testing
 import WebKit
 @testable import WBMC
@@ -33,6 +35,76 @@ struct SafeHTMLViewTests {
         #expect(!webView.configuration.websiteDataStore.isPersistent)
         #expect(webView.title == "Safe mail")
         #expect(!coordinator.navigationURLs.contains { ["http", "https"].contains($0.scheme ?? "") })
+    }
+
+    @Test func remoteSubresourceNeverReachesServer() async throws {
+        let parameters = NWParameters.tcp
+        parameters.requiredInterfaceType = .loopback
+        if let internet = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            internet.version = .v4
+        }
+        let listener = try NWListener(using: parameters, on: .any)
+        let accepted = Mutex(0)
+        listener.newConnectionHandler = { connection in
+            accepted.withLock { $0 += 1 }
+            connection.cancel()
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let resumed = Mutex(false)
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    let first = resumed.withLock { value -> Bool in
+                        if value { return false }
+                        value = true
+                        return true
+                    }
+                    if first { continuation.resume() }
+                case .failed(let error):
+                    let first = resumed.withLock { value -> Bool in
+                        if value { return false }
+                        value = true
+                        return true
+                    }
+                    if first { continuation.resume(throwing: error) }
+                default:
+                    break
+                }
+            }
+            listener.start(queue: .global(qos: .userInitiated))
+        }
+        defer { listener.cancel() }
+        let port = try #require(listener.port)
+        let probe = NWConnection(host: .ipv4(try #require(IPv4Address("127.0.0.1"))), port: port, using: .tcp)
+        probe.start(queue: .global(qos: .userInitiated))
+        var probeCount = 0
+        for _ in 0..<100 {
+            probeCount = accepted.withLock { $0 }
+            if probeCount >= 1 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        probe.cancel()
+        #expect(probeCount == 1)
+        accepted.withLock { $0 = 0 }
+        let address = "http://127.0.0.1:\(port.rawValue)/x.png"
+        let html = """
+        <html><head>
+        <link rel="stylesheet" href="\(address)">
+        <style>body { background-image: url("\(address)"); }</style>
+        </head><body>
+        <img src="\(address)" srcset="\(address) 1x, \(address) 2x">
+        </body></html>
+        """
+        let coordinator = SafeHTMLView.Coordinator()
+        let webView = SafeHTMLView.makeSecureWebView(coordinator: coordinator)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = webView
+        defer { window.contentView = nil; webView.stopLoading() }
+        await coordinator.load(html: html, in: webView)
+        try await Task.sleep(for: .seconds(2))
+        #expect(coordinator.didFinish)
+        #expect(accepted.withLock { $0 } == 0)
     }
 
     @Test func navigationPolicyRejectsFormsAndOnlyOpensLinksExternally() {

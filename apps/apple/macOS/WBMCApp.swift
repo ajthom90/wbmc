@@ -51,7 +51,7 @@ struct WBMCApp: App {
                 Button("Copy refresh token…") {
                     NotificationCenter.default.post(name: .copyRefreshToken, object: nil)
                 }
-                .disabled(model?.accounts.contains(where: { $0.kind == "microsoft" }) != true)
+                .disabled(model?.accounts.contains(where: { $0.kind == "microsoft" || $0.kind == "google" }) != true)
             }
         }
         #endif
@@ -62,14 +62,17 @@ private struct ReaderWindow: View {
     let model: AppModel
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var showingAddAccount = false
-    @State private var signingInAgain = false
+    @State private var resumeAccount: AccountInfo?
     #if DEBUG
     @State private var showingTokens = false
     #endif
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            Sidebar(model: model) { signingInAgain = true; showingAddAccount = true }
+            Sidebar(model: model) { account in
+                resumeAccount = account
+                showingAddAccount = true
+            }
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220)
         } content: {
             MessageList(model: model).navigationSplitViewColumnWidth(min: 260, ideal: 330)
@@ -81,11 +84,16 @@ private struct ReaderWindow: View {
             ToolbarItemGroup {
                 Button { Task { await model.refresh() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                     .help("Refresh")
-                Button { signingInAgain = false; showingAddAccount = true } label: { Label("Add Account", systemImage: "plus") }
+                Button {
+                    resumeAccount = nil
+                    showingAddAccount = true
+                } label: { Label("Add Account", systemImage: "plus") }
                     .help("Add Account")
             }
         }
-        .sheet(isPresented: $showingAddAccount) { AddAccount(model: model, startWithMicrosoft: signingInAgain) }
+        .sheet(isPresented: $showingAddAccount, onDismiss: { resumeAccount = nil }) {
+            AddAccount(model: model, resume: resumeAccount)
+        }
         #if DEBUG
         .onReceive(NotificationCenter.default.publisher(for: .copyRefreshToken)) { _ in showingTokens = true }
         .sheet(isPresented: $showingTokens) { RefreshTokenSheet(model: model) }
@@ -105,13 +113,13 @@ private struct RefreshTokenSheet: View {
     @State private var confirming = false
     @State private var errorMessage: String?
 
-    private var microsoftAccounts: [AccountInfo] { model.accounts.filter { $0.kind == "microsoft" } }
+    private var oauthAccounts: [AccountInfo] { model.accounts.filter { $0.kind == "microsoft" || $0.kind == "google" } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Copy refresh token…").font(.title2)
-            Picker("Microsoft account", selection: $accountID) {
-                ForEach(microsoftAccounts, id: \.id) { Text($0.email).tag($0.id) }
+            Picker("Account", selection: $accountID) {
+                ForEach(oauthAccounts, id: \.id) { Text($0.email).tag($0.id) }
             }
             if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
             HStack {
@@ -121,7 +129,7 @@ private struct RefreshTokenSheet: View {
             }
         }
         .padding(24).frame(width: 440)
-        .onAppear { accountID = microsoftAccounts.first?.id ?? "" }
+        .onAppear { accountID = oauthAccounts.first?.id ?? "" }
         .alert("Copy a secret to the clipboard?", isPresented: $confirming) {
             Button("Cancel", role: .cancel) {}
             Button("Copy Token") { copyToken() }

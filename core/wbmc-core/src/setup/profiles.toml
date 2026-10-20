@@ -1,0 +1,120 @@
+# This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+# If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Bundled account profiles. The first matching domain wins and skips the network.
+# Yahoo, AOL, and iCloud host/port/security/username were checked on 2026-10-20
+# against each entry's source URL. Domain lists are the Thunderbird ISPDB sets
+# for those servers, except cox.net (not a Yahoo address).
+
+[[profile]]
+domains = ["gmail.com", "googlemail.com"]
+kind = "google"
+
+[[profile]]
+domains = ["outlook.com", "hotmail.com", "live.com", "msn.com"]
+kind = "microsoft"
+
+# verified 2026-10-20
+# IMAP imap.mail.yahoo.com:993 SSL, SMTP smtp.mail.yahoo.com:465 SSL,
+# username = full email address.
+# source: https://help.yahoo.com/kb/SLN4075.html
+[[profile]]
+domains = [
+  "yahoo.com",
+  "yahoo.ca",
+  "yahoo.de",
+  "yahoo.it",
+  "yahoo.fr",
+  "yahoo.es",
+  "yahoo.se",
+  "yahoo.co.in",
+  "yahoo.co.uk",
+  "yahoo.co.nz",
+  "yahoo.com.au",
+  "yahoo.com.ar",
+  "yahoo.com.br",
+  "yahoo.com.mx",
+  "ymail.com",
+  "myyahoo.com",
+  "rocketmail.com",
+]
+kind = "imap"
+name = "Yahoo"
+host = "imap.mail.yahoo.com"
+port = 993
+security = "tls"
+smtp_host = "smtp.mail.yahoo.com"
+smtp_port = 465
+smtp_security = "tls"
+username = "email"
+app_password_url = "https://help.yahoo.com/kb/new-yahoo-mail/generate-password-sln15241.html"
+source = "https://help.yahoo.com/kb/SLN4075.html"
+
+# verified 2026-10-20
+# IMAP imap.aol.com:993 SSL, SMTP smtp.aol.com:465 SSL, username = full email address.
+# source: https://help.aol.com/articles/how-do-i-use-other-email-applications-to-send-and-receive-my-aol-mail
+[[profile]]
+domains = [
+  "aol.com",
+  "aim.com",
+  "netscape.net",
+  "netscape.com",
+  "compuserve.com",
+  "cs.com",
+  "wmconnect.com",
+  "aol.de",
+  "aol.it",
+  "aol.fr",
+  "aol.es",
+  "aol.se",
+  "aol.co.uk",
+  "aol.co.nz",
+  "aol.com.au",
+  "aol.com.ar",
+  "aol.com.br",
+  "aol.com.mx",
+]
+kind = "imap"
+name = "AOL"
+host = "imap.aol.com"
+port = 993
+security = "tls"
+smtp_host = "smtp.aol.com"
+smtp_port = 465
+smtp_security = "tls"
+username = "email"
+app_password_url = "https://help.aol.com/articles/create-and-manage-app-password"
+source = "https://help.aol.com/articles/how-do-i-use-other-email-applications-to-send-and-receive-my-aol-mail"
+
+# verified 2026-10-20
+# IMAP imap.mail.me.com:993 SSL. Username is usually the local part; if that fails, the full address.
+# SMTP smtp.mail.me.com:587. Apple says SSL is required and to try STARTTLS, so smtp_security is starttls.
+# source: https://support.apple.com/en-us/102525
+[[profile]]
+domains = ["icloud.com", "me.com", "mac.com"]
+kind = "imap"
+name = "iCloud"
+host = "imap.mail.me.com"
+port = 993
+security = "tls"
+smtp_host = "smtp.mail.me.com"
+smtp_port = 587
+smtp_security = "starttls"
+username = "local_then_email"
+app_password_url = "https://support.apple.com/en-us/102654"
+source = "https://support.apple.com/en-us/102525"
+
+# Dev GreenMail. Plaintext is allowed only because the host is localhost.
+# .test is an IANA-reserved TLD and never resolves. No app-password page.
+[[profile]]
+domains = ["wbmc.test"]
+kind = "imap"
+name = "WBMC Test"
+host = "localhost"
+port = 3143
+security = "none"
+smtp_host = "localhost"
+smtp_port = 3025
+smtp_security = "none"
+username = "email"
+source = "dev/mail/docker-compose.yml"

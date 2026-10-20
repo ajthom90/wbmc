@@ -5,20 +5,30 @@ import WBMCCore
 
 typealias CoreClient = WbmcCoreProtocol
 
-protocol MicrosoftSignInFlow: AnyObject, Sendable {
+protocol OAuthSignInFlow: AnyObject, Sendable {
     func url() -> String
     func finish() async throws -> AccountInfo
+    func cancel()
 }
 
-extension MicrosoftSignIn: MicrosoftSignInFlow {}
+extension OAuthSignIn: OAuthSignInFlow {}
 
 protocol SignInStarter: Sendable {
-    func start() throws -> any MicrosoftSignInFlow
+    func start(provider: String, loginHint: String?) throws -> any OAuthSignInFlow
 }
 
 struct CoreSignInStarter: SignInStarter {
     let core: any CoreClient
-    func start() throws -> any MicrosoftSignInFlow { try core.beginMicrosoftSignIn() }
+    func start(provider: String, loginHint: String?) throws -> any OAuthSignInFlow {
+        try core.beginSignIn(provider: provider, loginHint: loginHint)
+    }
+}
+
+func needsSignInMessage(kind: String) -> String {
+    if kind == "microsoft" || kind == "google" {
+        return "Please sign in to this account again."
+    }
+    return "Sign-in failed. Add the account again with the new password to update it."
 }
 
 func friendlyError(_ error: any Error) -> String {

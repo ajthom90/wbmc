@@ -36,6 +36,7 @@ pub struct SyncEngine {
     store: Arc<Store>,
     bodies: Arc<BodyStore>,
     events: Arc<dyn EventSink>,
+    provider_timeout: Duration,
 }
 
 impl SyncEngine {
@@ -44,7 +45,13 @@ impl SyncEngine {
             store,
             bodies,
             events,
+            provider_timeout: PROVIDER_CALL_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    fn set_provider_call_timeout(&mut self, timeout: Duration) {
+        self.provider_timeout = timeout;
     }
 
     pub async fn sync_account(&self, account: &Account, provider: &dyn MailProvider) -> Result<()> {
@@ -95,6 +102,21 @@ impl SyncEngine {
     async fn sync(&self, account: &Account, provider: &dyn MailProvider) -> Result<()> {
         let remote_folders = call_provider(provider.list_folders()).await?;
         let mut folders = self.upsert_folders(account, remote_folders)?;
+        if folders
+            .iter()
+            .any(|(folder, _)| folder.role == FolderRole::Inbox)
+        {
+            let remote_ids: Vec<String> = folders
+                .iter()
+                .map(|(_, remote)| remote.remote_id.clone())
+                .collect();
+            self.remove_bodies(
+                account,
+                self.store.delete_folders_not_in(&account.id, &remote_ids)?,
+            )?;
+        } else {
+            tracing::warn!("remote folder list has no Inbox; keeping local folders");
+        }
         self.events.emit(CoreEvent::FoldersChanged {
             account_id: account.id.clone(),
         });
@@ -248,14 +270,58 @@ impl SyncEngine {
         provider: &dyn MailProvider,
         inbox: &FolderId,
     ) -> Result<()> {
+        let mut pending = Vec::new();
         for message in self.store.messages(inbox, 0, PAGE_SIZE)? {
-            match self.body(account, provider, &message.id).await {
-                Err(error @ CoreError::NeedsSignIn { .. }) => return Err(error),
+            if self.cached_body(account, &message.id)?.is_none() {
+                pending.push(message);
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let folder = self
+            .store
+            .folders(&account.id)?
+            .into_iter()
+            .find(|folder| folder.id == *inbox)
+            .ok_or_else(|| CoreError::NotFound(format!("folder {}", inbox.as_str())))?;
+        let ids: Vec<String> = pending
+            .iter()
+            .map(|message| message.remote_id.clone())
+            .collect();
+        let fetched = match tokio::time::timeout(
+            self.provider_timeout,
+            provider.fetch_raw_many(&folder.remote_id, &ids),
+        )
+        .await
+        {
+            Ok(fetched) => fetched,
+            Err(_) => {
+                tracing::warn!("body prefetch timed out");
+                ids.into_iter()
+                    .map(|id| (id, Err(CoreError::Network("timed out".into()))))
+                    .collect()
+            }
+        };
+        let mut needs_sign_in = None;
+        let pending: std::collections::HashMap<_, _> = pending
+            .iter()
+            .map(|message| (message.remote_id.as_str(), message))
+            .collect();
+        for (remote_id, result) in fetched {
+            let Some(message) = pending.get(remote_id.as_str()) else {
+                continue;
+            };
+            match result {
+                Ok(raw) => self.bodies.put(&account.id, &message.id, &raw)?,
+                Err(error @ CoreError::NeedsSignIn { .. }) => needs_sign_in = Some(error),
                 Err(error) => {
                     tracing::warn!("body prefetch failed for {}: {error}", message.id.as_str());
                 }
-                Ok(_) => {}
             }
+        }
+        if let Some(error) = needs_sign_in {
+            return Err(error);
         }
         Ok(())
     }
@@ -427,6 +493,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleted_label_folder_removed() {
+        let h = Harness::new();
+        let initial = FakeProvider::new(
+            vec![
+                remote_folder("inbox", FolderRole::Inbox),
+                remote_folder("label", FolderRole::Other),
+            ],
+            HashMap::from([
+                ("inbox".into(), vec![remote_message(1)]),
+                ("label".into(), vec![remote_message(2)]),
+            ]),
+        );
+        h.engine.sync_account(&h.account, &initial).await.unwrap();
+        let label = h.folder("label");
+        let removed = h.store.messages(&label.id, 0, 10).unwrap()[0].id.clone();
+        h.engine.body(&h.account, &initial, &removed).await.unwrap();
+        assert!(h.bodies.get(&h.account.id, &removed).unwrap().is_some());
+        let inbox = h.folder("inbox");
+        let kept = h.store.messages(&inbox.id, 0, 10).unwrap()[0].id.clone();
+        h.events.0.lock().unwrap().clear();
+        let remaining = provider(2, FolderRole::Inbox);
+        h.engine.sync_account(&h.account, &remaining).await.unwrap();
+        let folders = h.store.folders(&h.account.id).unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].id, inbox.id);
+        assert!(h.store.message(&removed).unwrap().is_none());
+        assert!(h.bodies.get(&h.account.id, &removed).unwrap().is_none());
+        assert!(h.store.message(&kept).unwrap().is_some());
+        assert!(h.bodies.get(&h.account.id, &kept).unwrap().is_some());
+        assert!(
+            h.events
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event,
+            CoreEvent::FoldersChanged { account_id } if account_id == &h.account.id))
+        );
+        let empty = FakeProvider::new(vec![], HashMap::new());
+        h.engine.sync_account(&h.account, &empty).await.unwrap();
+        assert_eq!(h.store.folders(&h.account.id).unwrap(), folders);
+        assert!(h.store.message(&kept).unwrap().is_some());
+        assert!(h.bodies.get(&h.account.id, &kept).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn folder_list_without_inbox_keeps_local_data_and_continues_sync() {
+        let h = Harness::new();
+        let initial = provider(1, FolderRole::Inbox);
+        h.engine.sync_account(&h.account, &initial).await.unwrap();
+        let inbox = h.folder("inbox");
+        let kept = h.store.messages(&inbox.id, 0, 10).unwrap()[0].id.clone();
+        let partial = FakeProvider::new(
+            vec![remote_folder("label", FolderRole::Other)],
+            HashMap::from([("label".into(), vec![remote_message(2)])]),
+        );
+        h.engine.sync_account(&h.account, &partial).await.unwrap();
+        assert_eq!(h.store.folders(&h.account.id).unwrap().len(), 2);
+        assert!(h.store.message(&kept).unwrap().is_some());
+        assert!(h.bodies.get(&h.account.id, &kept).unwrap().is_some());
+        assert_eq!(
+            h.store
+                .messages(&h.folder("label").id, 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn syncs_all_pages_inbox_first() {
         let h = Harness::new();
         let provider = FakeProvider::new(
@@ -493,8 +629,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // list + 5 pages + exactly 200 body fetches.
-        assert_eq!(provider.provider_calls(), 206);
+        // list + 5 pages + one batched prefetch of the newest 200.
+        assert_eq!(provider.provider_calls(), 7);
     }
 
     #[tokio::test]
@@ -511,8 +647,8 @@ mod tests {
             h.statuses().last(),
             Some(SyncStatus::Error { .. })
         ));
-        // list + the successful page + the failed page, then a prefetch of the 200 stored messages.
-        assert_eq!(provider.provider_calls(), 203);
+        // list + the successful page + the failed page, then one batched prefetch.
+        assert_eq!(provider.provider_calls(), 4);
         provider.set_fail_after_pages(None);
         h.engine.sync_account(&h.account, &provider).await.unwrap();
         let after = h.store.messages(&inbox.id, 0, 500).unwrap();
@@ -526,8 +662,8 @@ mod tests {
             );
         }
         assert_eq!(h.statuses().last(), Some(&SyncStatus::Idle));
-        // A resumed pass takes two pages, not three.
-        assert_eq!(provider.provider_calls(), 206);
+        // A resumed pass takes two pages, not three. The newest 200 are already cached.
+        assert_eq!(provider.provider_calls(), 7);
     }
 
     #[tokio::test]
@@ -686,6 +822,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefetch_uses_one_batch() {
+        let h = Harness::new();
+        let provider = provider(200, FolderRole::Inbox);
+        h.engine.sync_account(&h.account, &provider).await.unwrap();
+        assert_eq!(provider.fetch_raw_many_calls(), 1);
+        assert_eq!(provider.fetch_raw_calls(), 0);
+        let rows = h.store.messages(&h.folder("inbox").id, 0, 200).unwrap();
+        assert_eq!(rows.len(), 200);
+        for row in &rows {
+            assert!(
+                h.bodies.get(&h.account.id, &row.id).unwrap().is_some(),
+                "missing body for {}",
+                row.remote_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_matches_bodies_by_remote_id() {
+        let h = Harness::new();
+        let provider = provider(3, FolderRole::Inbox);
+        provider.set_reverse_prefetch(true);
+        h.engine.sync_account(&h.account, &provider).await.unwrap();
+        let rows = h.store.messages(&h.folder("inbox").id, 0, 200).unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            let raw = h.bodies.get(&h.account.id, &row.id).unwrap().unwrap();
+            assert!(
+                String::from_utf8(raw)
+                    .unwrap()
+                    .contains(&format!("Subject: Subject {}\r\n", row.remote_id))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_hang_finishes_within_deadline() {
+        let mut h = Harness::new();
+        let deadline = std::time::Duration::from_millis(80);
+        h.engine.set_provider_call_timeout(deadline);
+        let provider = provider(3, FolderRole::Inbox);
+        provider.set_hang_fetch_raw_many(true);
+        let started = std::time::Instant::now();
+        h.engine.sync_account(&h.account, &provider).await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "prefetch hung for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(h.statuses().last(), Some(&SyncStatus::Idle));
+        let rows = h.store.messages(&h.folder("inbox").id, 0, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert!(h.bodies.get(&h.account.id, &row.id).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn prefetch_stops_on_needs_sign_in() {
         let h = Harness::new();
         let provider = provider(3, FolderRole::Inbox);
@@ -693,7 +887,7 @@ mod tests {
 
         let result = h.engine.sync_account(&h.account, &provider).await;
 
-        // One list call, one page, and exactly one fetch_raw attempt.
+        // One list call, one page, and one batched prefetch that needs sign-in.
         assert_eq!(provider.provider_calls(), 3);
         assert!(matches!(result, Err(CoreError::NeedsSignIn { .. })));
         assert_eq!(
@@ -840,7 +1034,8 @@ mod tests {
             );
         }
         assert_eq!(h.statuses().last(), Some(&SyncStatus::Idle));
-        assert_eq!(provider.provider_calls(), 5);
+        // list + one page + one batched prefetch.
+        assert_eq!(provider.provider_calls(), 3);
     }
 
     #[tokio::test]

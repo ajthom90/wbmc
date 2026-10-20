@@ -1,7 +1,9 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 mod bodies;
+mod migrations;
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -17,14 +19,15 @@ use crate::{CoreError, Result};
 pub use bodies::BodyStore;
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = migrations::STEPS[migrations::STEPS.len() - 1].0;
 
 const ACCOUNT_COLUMNS: &str = "id, kind, email, display_name, config";
 const FOLDER_COLUMNS: &str =
     "id, account_id, remote_id, name, role, parent_id, unread_count, total_count";
 const MESSAGE_COLUMNS: &str = "\
-id, account_id, folder_id, remote_id, subject, from_json, to_json, cc_json, \
-date_ms, snippet, is_read, is_flagged, has_attachments";
+messages.id, messages.account_id, messages.folder_id, messages.remote_id, messages.subject, \
+messages.from_json, messages.to_json, messages.cc_json, messages.date_ms, messages.snippet, \
+messages.is_read, messages.is_flagged, messages.has_attachments";
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -87,6 +90,28 @@ impl Store {
         Ok(())
     }
 
+    /// Updates the kind-independent columns (`email`, `display_name`, `config`).
+    pub fn update_account(&self, account: &Account) -> Result<()> {
+        let conn = self.lock()?;
+        let config = json_text(&account.config)?;
+        let changed = conn.execute(
+            "UPDATE accounts SET email = ?2, display_name = ?3, config = ?4 WHERE id = ?1",
+            params![
+                account.id.as_str(),
+                account.email,
+                account.display_name,
+                config,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(CoreError::NotFound(format!(
+                "account {}",
+                account.id.as_str()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(&format!(
@@ -140,6 +165,45 @@ impl Store {
         let rows = stmt.query_map([account_id.as_str()], map_folder)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Removes folders absent from the server and returns their message ids for body cleanup.
+    pub fn delete_folders_not_in(
+        &self,
+        account: &AccountId,
+        remote_ids: &[String],
+    ) -> Result<Vec<MessageId>> {
+        let retained: HashSet<&str> = remote_ids.iter().map(String::as_str).collect();
+        self.in_transaction(|tx| {
+            let mut stmt = tx.prepare("SELECT id, remote_id FROM folders WHERE account_id = ?1")?;
+            let rows = stmt.query_map([account.as_str()], |row| {
+                Ok((
+                    FolderId::from(row.get::<_, String>(0)?),
+                    row.get::<_, String>(1)?,
+                ))
+            })?;
+            let mut doomed = Vec::new();
+            for row in rows {
+                let (id, remote_id) = row?;
+                if !retained.contains(remote_id.as_str()) {
+                    doomed.push(id);
+                }
+            }
+            // Detach children before deletion: the schema cascades parent deletes.
+            // A child still present on the server must survive a removed parent.
+            for id in &doomed {
+                tx.execute(
+                    "UPDATE folders SET parent_id = NULL WHERE parent_id = ?1",
+                    [id.as_str()],
+                )?;
+            }
+            let mut removed = Vec::new();
+            for id in &doomed {
+                removed.extend(clear_folder_tx(tx, id)?);
+                tx.execute("DELETE FROM folders WHERE id = ?1", [id.as_str()])?;
+            }
+            Ok(removed)
+        })
     }
 
     pub fn folder_sync_state(&self, folder_id: &FolderId) -> Result<Option<String>> {
@@ -251,6 +315,29 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Returns messages across all accounts in folders with the requested role.
+    pub fn unified_messages(
+        &self,
+        role: FolderRole,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<MessageSummary>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             JOIN folders ON messages.folder_id = folders.id
+             WHERE folders.role = ?1
+             ORDER BY messages.date_ms DESC, messages.id DESC
+             LIMIT ?2 OFFSET ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![role.as_str(), i64::from(limit), i64::from(offset)],
+            map_message,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn recount(&self, folder_id: &FolderId) -> Result<()> {
@@ -430,32 +517,41 @@ fn folder_not_found(folder: &FolderId) -> CoreError {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    let has_version: i64 = conn.query_row(
+    let tx = conn.unchecked_transaction()?;
+    let has_version: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
         [],
         |row| row.get(0),
     )?;
-    if has_version == 0 {
-        let tx = conn.unchecked_transaction()?;
+    let version = if has_version == 0 {
         tx.execute_batch(SCHEMA_SQL)?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (1)", [])?;
+        1
+    } else {
+        tx.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+    };
+    if version > SCHEMA_VERSION {
+        return Err(CoreError::Storage(
+            "This mail database was created by a newer version of WBMC.".into(),
+        ));
+    }
+    for &(step_version, sql) in migrations::STEPS {
+        if step_version > version {
+            tx.execute_batch(sql)?;
+        }
+    }
+    if version < SCHEMA_VERSION {
+        tx.execute("DELETE FROM schema_version", [])?;
         tx.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [SCHEMA_VERSION],
         )?;
-        tx.commit()?;
-        return Ok(());
     }
-
-    let version: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-        [],
-        |row| row.get(0),
-    )?;
-    if version != SCHEMA_VERSION {
-        return Err(CoreError::Storage(format!(
-            "unsupported schema version {version}"
-        )));
-    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -612,6 +708,282 @@ mod tests {
     }
 
     #[test]
+    fn v1_database_upgrades_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wbmc.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(super::SCHEMA_SQL).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (1)", [])
+            .unwrap();
+        let v1 = Store {
+            conn: std::sync::Mutex::new(conn),
+        };
+        let account = account();
+        v1.insert_account(&account).unwrap();
+        let inbox = v1.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+        let mut sent = folder(&account.id, "Sent");
+        sent.role = FolderRole::Sent;
+        let sent = v1.upsert_folder(&sent).unwrap();
+        let messages = vec![
+            message(&account.id, &inbox.id, "a", 1, false),
+            message(&account.id, &sent.id, "b", 2, true),
+            message(&account.id, &inbox.id, "c", 3, true),
+        ];
+        v1.upsert_messages(&messages).unwrap();
+        v1.set_folder_sync_state(&inbox.id, "cursor-v1").unwrap();
+        v1.recount(&inbox.id).unwrap();
+        let folders = v1.folders(&account.id).unwrap();
+        drop(v1);
+
+        // Opening twice also checks that the migration is not reapplied.
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.accounts().unwrap(), vec![account.clone()]);
+            assert_eq!(store.folders(&account.id).unwrap(), folders);
+            for msg in &messages {
+                assert_eq!(store.message(&msg.id).unwrap().as_ref(), Some(msg));
+            }
+            assert_eq!(
+                store.folder_sync_state(&inbox.id).unwrap().as_deref(),
+                Some("cursor-v1")
+            );
+            let conn = store.lock().unwrap();
+            let versions: Vec<i64> = conn
+                .prepare("SELECT version FROM schema_version")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            assert_eq!(versions, vec![2]);
+            let index_sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_date'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                index_sql,
+                "CREATE INDEX idx_messages_date ON messages (date_ms DESC)"
+            );
+        }
+    }
+
+    #[test]
+    fn newer_version_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wbmc.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(super::SCHEMA_SQL).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (99)", [])
+            .unwrap();
+        drop(conn);
+
+        let error = Store::open(&path)
+            .err()
+            .expect("version 99 must be refused");
+        assert!(matches!(
+            error,
+            crate::CoreError::Storage(ref message)
+                if message == "This mail database was created by a newer version of WBMC."
+        ));
+    }
+
+    #[test]
+    fn migration_failure_rolls_back_fresh_schema() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blocker (date_ms INTEGER);
+             CREATE INDEX idx_messages_date ON blocker (date_ms);",
+        )
+        .unwrap();
+
+        assert!(super::migrate(&conn).is_err());
+        let baseline_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN ('schema_version', 'accounts', 'folders', 'messages')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(baseline_tables, 0);
+    }
+
+    #[test]
+    fn migration_failure_rolls_back_upgrade() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(super::SCHEMA_SQL).unwrap();
+        conn.execute_batch(
+            "INSERT INTO schema_version (version) VALUES (1);
+             CREATE TRIGGER reject_version_change BEFORE DELETE ON schema_version
+             BEGIN SELECT RAISE(ABORT, 'injected version failure'); END;",
+        )
+        .unwrap();
+
+        assert!(super::migrate(&conn).is_err());
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_messages_date'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 0);
+    }
+
+    #[test]
+    fn fresh_database_is_v2_and_unified_uses_date_index() {
+        let (_dir, store) = temp_store();
+        let conn = store.lock().unwrap();
+        let versions: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(versions, vec![2]);
+        let plan: Vec<String> = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT {} FROM messages
+                 JOIN folders ON messages.folder_id = folders.id
+                 WHERE folders.role = ?1
+                 ORDER BY messages.date_ms DESC, messages.id DESC
+                 LIMIT ?2 OFFSET ?3",
+                super::MESSAGE_COLUMNS
+            ))
+            .unwrap()
+            .query_map(
+                rusqlite::params![FolderRole::Inbox.as_str(), 100, 0],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_messages_date")),
+            "unified query should use the date index: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn unified_merges_inboxes_newest_first() {
+        let (_dir, store) = temp_store();
+        let mut expected = Vec::new();
+        let mut sent_messages = Vec::new();
+        for account_index in 0..2 {
+            let mut account = account();
+            account.email = format!("account{account_index}@example.com");
+            store.insert_account(&account).unwrap();
+            let inbox = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+            let mut sent = folder(&account.id, "Sent");
+            sent.role = FolderRole::Sent;
+            let sent = store.upsert_folder(&sent).unwrap();
+            for i in 0..3 {
+                expected.push(message(
+                    &account.id,
+                    &inbox.id,
+                    &format!("inbox-{i}"),
+                    i * 2 + account_index,
+                    i % 2 == 0,
+                ));
+            }
+            // Equal dates across accounts must use descending message ids.
+            expected.push(message(&account.id, &inbox.id, "tie", 10, false));
+            sent_messages.push(message(&account.id, &sent.id, "sent", 100, true));
+        }
+        store.upsert_messages(&expected).unwrap();
+        store.upsert_messages(&sent_messages).unwrap();
+        expected.sort_by(|a, b| {
+            b.date_ms
+                .cmp(&a.date_ms)
+                .then_with(|| b.id.as_str().cmp(a.id.as_str()))
+        });
+        assert_eq!(
+            store.unified_messages(FolderRole::Inbox, 0, 100).unwrap(),
+            expected
+        );
+        assert_eq!(
+            store.unified_messages(FolderRole::Inbox, 0, 3).unwrap(),
+            expected[..3]
+        );
+        assert_eq!(
+            store.unified_messages(FolderRole::Inbox, 3, 3).unwrap(),
+            expected[3..6]
+        );
+        assert_eq!(
+            store.unified_messages(FolderRole::Inbox, 6, 3).unwrap(),
+            expected[6..]
+        );
+        assert!(
+            store
+                .unified_messages(FolderRole::Inbox, 8, 3)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .unified_messages(FolderRole::Inbox, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .unified_messages(FolderRole::Trash, 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let sent = store.unified_messages(FolderRole::Sent, 0, 10).unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent_messages.iter().all(|message| sent.contains(message)));
+    }
+
+    #[test]
+    #[ignore]
+    fn unified_perf() {
+        let (_dir, store) = temp_store();
+        for account_index in 0..3 {
+            let mut account = account();
+            account.email = format!("account{account_index}@example.com");
+            store.insert_account(&account).unwrap();
+            let inbox = store.upsert_folder(&folder(&account.id, "INBOX")).unwrap();
+            let mut sent = folder(&account.id, "Sent");
+            sent.role = FolderRole::Sent;
+            let sent = store.upsert_folder(&sent).unwrap();
+            let batch: Vec<_> = (0..50_000)
+                .map(|i| {
+                    let folder = if i % 5 < 2 { &inbox } else { &sent };
+                    message(
+                        &account.id,
+                        &folder.id,
+                        &format!("r{i}"),
+                        i * 3 + account_index,
+                        false,
+                    )
+                })
+                .collect();
+            store.upsert_messages(&batch).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let messages = store.unified_messages(FolderRole::Inbox, 0, 100).unwrap();
+        let elapsed = start.elapsed();
+        println!("unified_perf: {elapsed:?} (150,000 messages, 60,000 Inbox)");
+        assert_eq!(messages.len(), 100);
+        assert!(
+            elapsed < std::time::Duration::from_millis(20),
+            "unified_messages took {elapsed:?}, expected < 20 ms"
+        );
+    }
+
+    #[test]
     fn ids_are_uuid_v7_strings() {
         let id = MessageId::new();
         let parsed = uuid::Uuid::parse_str(id.as_str()).unwrap();
@@ -684,6 +1056,128 @@ mod tests {
         assert_eq!(tail.len(), 50);
         assert_eq!(tail[0].date_ms, 49);
         assert_eq!(tail.last().unwrap().date_ms, 0);
+    }
+
+    #[test]
+    fn update_account_replaces_email_name_and_config() {
+        let (_dir, store) = temp_store();
+        let original = account();
+        store.insert_account(&original).unwrap();
+        let mut updated = original.clone();
+        updated.kind = ProviderKind::Microsoft;
+        updated.email = "new@example.com".into();
+        updated.display_name = "New Name".into();
+        updated.config = serde_json::json!({"smtp_port": 2525});
+
+        store.update_account(&updated).unwrap();
+
+        let stored = store.accounts().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, original.id);
+        assert_eq!(stored[0].kind, ProviderKind::Imap);
+        assert_eq!(stored[0].email, "new@example.com");
+        assert_eq!(stored[0].display_name, "New Name");
+        assert_eq!(stored[0].config["smtp_port"], 2525);
+
+        let missing = account();
+        let error = store.update_account(&missing).unwrap_err();
+        assert!(matches!(error, crate::CoreError::NotFound(_)), "{error}");
+    }
+
+    #[test]
+    fn delete_folders_not_in_returns_messages_and_is_account_scoped() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        let mut other = account.clone();
+        other.id = AccountId::new();
+        store.insert_account(&account).unwrap();
+        store.insert_account(&other).unwrap();
+        let kept = store.upsert_folder(&folder(&account.id, "keep")).unwrap();
+        let gone = store.upsert_folder(&folder(&account.id, "gone")).unwrap();
+        let other_folder = store.upsert_folder(&folder(&other.id, "gone")).unwrap();
+        let kept_msg = message(&account.id, &kept.id, "k", 1, false);
+        let gone_msg = message(&account.id, &gone.id, "g", 1, false);
+        let other_msg = message(&other.id, &other_folder.id, "o", 1, false);
+        store
+            .upsert_messages(&[kept_msg.clone(), gone_msg.clone(), other_msg.clone()])
+            .unwrap();
+        let removed = store
+            .delete_folders_not_in(&account.id, &["keep".into()])
+            .unwrap();
+        assert_eq!(removed, vec![gone_msg.id.clone()]);
+        assert!(store.message(&gone_msg.id).unwrap().is_none());
+        assert!(store.message(&kept_msg.id).unwrap().is_some());
+        assert!(store.message(&other_msg.id).unwrap().is_some());
+        assert_eq!(store.folders(&account.id).unwrap(), vec![kept]);
+        assert_eq!(store.folders(&other.id).unwrap(), vec![other_folder]);
+        assert!(
+            store
+                .delete_folders_not_in(&account.id, &["keep".into()])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.delete_folders_not_in(&account.id, &[]).unwrap(),
+            vec![kept_msg.id]
+        );
+        assert!(store.folders(&account.id).unwrap().is_empty());
+        assert!(store.message(&other_msg.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_folders_not_in_preserves_retained_child_and_rolls_back() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        store.insert_account(&account).unwrap();
+        let parent = store.upsert_folder(&folder(&account.id, "parent")).unwrap();
+        let mut child = folder(&account.id, "child");
+        child.parent_id = Some(parent.id.clone());
+        let child = store.upsert_folder(&child).unwrap();
+        let gone = message(&account.id, &parent.id, "gone", 1, false);
+        let kept = message(&account.id, &child.id, "kept", 1, false);
+        store
+            .upsert_messages(&[gone.clone(), kept.clone()])
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_folder_delete BEFORE DELETE ON folders
+             BEGIN SELECT RAISE(ABORT, 'injected folder failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .delete_folders_not_in(&account.id, &["child".into()])
+                .is_err()
+        );
+        assert!(store.message(&gone.id).unwrap().is_some());
+        assert_eq!(
+            store
+                .folders(&account.id)
+                .unwrap()
+                .iter()
+                .find(|f| f.id == child.id)
+                .unwrap()
+                .parent_id,
+            Some(parent.id)
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_folder_delete")
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_folders_not_in(&account.id, &["child".into()])
+                .unwrap(),
+            vec![gone.id]
+        );
+        let folders = store.folders(&account.id).unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].id, child.id);
+        assert_eq!(folders[0].parent_id, None);
+        assert!(store.message(&kept.id).unwrap().is_some());
     }
 
     #[test]
@@ -827,7 +1321,7 @@ mod tests {
 
         let index_sql: String = conn
             .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages' AND sql IS NOT NULL",
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_folder_date'",
                 [],
                 |row| row.get(0),
             )

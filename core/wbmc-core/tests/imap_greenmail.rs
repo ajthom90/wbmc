@@ -421,6 +421,87 @@ async fn incremental_reports_flag_updates() {
 }
 
 #[tokio::test]
+async fn fetch_raw_many_one_session() {
+    if !imap_tests_enabled() {
+        return;
+    }
+    let provider = ready_provider().await;
+    let inbox = inbox(&provider).await;
+    let delta = provider.sync_folder(&inbox, None, 30).await.expect("page");
+    let mut ids: Vec<String> = delta
+        .upserts
+        .iter()
+        .take(25)
+        .map(|message| message.remote_id.clone())
+        .collect();
+    assert_eq!(ids.len(), 25, "seeded inbox did not yield 25 messages");
+    ids.reverse();
+    let before = provider.login_count();
+    let fetched = provider.fetch_raw_many(&inbox.remote_id, &ids).await;
+    assert_eq!(provider.login_count(), before + 1);
+    assert_eq!(fetched.len(), ids.len());
+    for (wanted, (got, raw)) in ids.iter().zip(fetched) {
+        assert_eq!(&got, wanted);
+        let raw = raw.unwrap_or_else(|error| panic!("uid {wanted}: {error}"));
+        let parsed = parse_message(&raw, 0);
+        let summary = delta
+            .upserts
+            .iter()
+            .find(|message| message.remote_id == *wanted)
+            .expect("summary");
+        assert_eq!(parsed.subject, summary.subject);
+    }
+}
+
+#[tokio::test]
+async fn fetch_raw_many_skips_missing_uid() {
+    if !imap_tests_enabled() {
+        return;
+    }
+    let mailbox = unique_mailbox();
+    let mut session = connect_session().await;
+    session.create(&mailbox).await.expect("create");
+    for index in 0..3 {
+        session
+            .append(
+                &mailbox,
+                None,
+                None,
+                rfc822(&format!("batch {index}"), index),
+            )
+            .await
+            .expect("append");
+    }
+    let _ = session.logout().await;
+
+    let provider = ready_provider().await;
+    let folder = RemoteFolder {
+        remote_id: mailbox.clone(),
+        name: mailbox.clone(),
+        role: FolderRole::Other,
+        parent_remote_id: None,
+    };
+    let delta = provider.sync_folder(&folder, None, 10).await.expect("sync");
+    let mut ids: Vec<String> = delta
+        .upserts
+        .iter()
+        .map(|message| message.remote_id.clone())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    ids.insert(1, "999999999".into());
+    let fetched = provider.fetch_raw_many(&mailbox, &ids).await;
+    assert_eq!(fetched.len(), 4);
+    assert_eq!(fetched[0].0, ids[0]);
+    assert!(fetched[0].1.is_ok(), "{:?}", fetched[0].1);
+    assert_eq!(fetched[1].0, "999999999");
+    assert!(fetched[1].1.is_err(), "missing uid was {:?}", fetched[1].1);
+    assert_eq!(fetched[2].0, ids[2]);
+    assert!(fetched[2].1.is_ok(), "{:?}", fetched[2].1);
+    assert_eq!(fetched[3].0, ids[3]);
+    assert!(fetched[3].1.is_ok(), "{:?}", fetched[3].1);
+}
+
+#[tokio::test]
 async fn fetch_raw_parses() {
     if !imap_tests_enabled() {
         return;

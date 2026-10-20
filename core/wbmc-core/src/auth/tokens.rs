@@ -5,9 +5,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::microsoft::{Endpoints, http_client, refresh_using};
+use super::oauth::{OAuthClient, not_configured, refresh};
 use super::{TokenSet, now_ms};
-use crate::model::AccountId;
+use crate::model::{AccountId, ProviderKind};
 use crate::secrets::{SecretStore, refresh_token_key};
 use crate::{CoreError, Result};
 
@@ -18,42 +18,32 @@ const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
 struct Entry {
     /// Cached access token and its expiry (epoch ms).
     token: Option<(String, i64)>,
+    stored_generation: u64,
     /// Held while refreshing so concurrent callers share one refresh.
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-/// Hands out Microsoft access tokens, refreshing (and persisting the rotated refresh
+/// Hands out OAuth access tokens, refreshing (and persisting the rotated refresh
 /// token) when they are close to expiry.
 pub struct TokenManager {
     secrets: Arc<dyn SecretStore>,
-    client_id: String,
-    endpoints: Endpoints,
+    clients: HashMap<ProviderKind, OAuthClient>,
     entries: std::sync::Mutex<HashMap<AccountId, Entry>>,
 }
 
 impl std::fmt::Debug for TokenManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenManager")
-            .field("client_id", &self.client_id)
-            .field("endpoints", &self.endpoints)
+            .field("clients", &self.clients)
             .finish_non_exhaustive()
     }
 }
 
 impl TokenManager {
-    pub fn new(secrets: Arc<dyn SecretStore>, client_id: String) -> Self {
-        Self::with_endpoints(secrets, client_id, Endpoints::default())
-    }
-
-    pub fn with_endpoints(
-        secrets: Arc<dyn SecretStore>,
-        client_id: String,
-        endpoints: Endpoints,
-    ) -> Self {
+    pub fn new(secrets: Arc<dyn SecretStore>, clients: HashMap<ProviderKind, OAuthClient>) -> Self {
         Self {
             secrets,
-            client_id,
-            endpoints,
+            clients,
             entries: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -78,7 +68,11 @@ impl TokenManager {
     /// Returns a valid access token for the account, refreshing if needed.
     ///
     /// Concurrent callers for the same account perform at most one refresh.
-    pub async fn access_token(&self, account_id: &AccountId) -> Result<String> {
+    pub async fn access_token(&self, account_id: &AccountId, kind: ProviderKind) -> Result<String> {
+        let client = self
+            .clients
+            .get(&kind)
+            .ok_or_else(|| CoreError::InvalidInput(not_configured(kind).into()))?;
         if let Some(token) = self.fresh_cached(account_id) {
             return Ok(token);
         }
@@ -89,51 +83,62 @@ impl TokenManager {
             .refresh_lock
             .clone();
         let _guard = refresh_lock.lock().await;
-        // Another caller may have refreshed while we waited.
-        if let Some(token) = self.fresh_cached(account_id) {
-            return Ok(token);
-        }
-
-        let needs_sign_in = || CoreError::NeedsSignIn {
-            account_id: account_id.as_str().to_string(),
-        };
-        let key = refresh_token_key(account_id);
-        let refresh_token = self
-            .secrets
-            .get(&key)?
-            .filter(|t| !t.is_empty())
-            .ok_or_else(needs_sign_in)?;
-        let http = http_client()?;
-        let tokens = refresh_using(&http, &self.endpoints, &self.client_id, &refresh_token)
-            .await
-            .map_err(|e| match e {
+        loop {
+            // Another caller may have refreshed or stored tokens while we waited.
+            if let Some(token) = self.fresh_cached(account_id) {
+                return Ok(token);
+            }
+            let needs_sign_in = || CoreError::NeedsSignIn {
+                account_id: account_id.as_str().to_string(),
+            };
+            let key = refresh_token_key(account_id);
+            let (generation, refresh_token) = {
+                let entries = self.entries();
+                let generation = entries
+                    .get(account_id)
+                    .expect("token entry")
+                    .stored_generation;
+                let refresh_token = self
+                    .secrets
+                    .get(&key)?
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(needs_sign_in)?;
+                (generation, refresh_token)
+            };
+            let result = refresh(client, &refresh_token).await;
+            let mut entries = self.entries();
+            let entry = entries.get_mut(account_id).expect("token entry");
+            if entry.stored_generation != generation {
+                // Interactive sign-in won the race. Re-read its tokens instead.
+                continue;
+            }
+            let tokens = result.map_err(|e| match e {
                 CoreError::NeedsSignIn { .. } => needs_sign_in(),
                 other => other,
             })?;
-        // Persist the rotated refresh token before handing out the new access token.
-        if let Some(rotated) = tokens.refresh_token.as_deref()
-            && rotated != refresh_token
-        {
-            self.secrets.set(&key, rotated)?;
+            // Serialize persistence and caching with `store`'s generation bump.
+            if let Some(rotated) = tokens.refresh_token.as_deref()
+                && rotated != refresh_token
+            {
+                self.secrets.set(&key, rotated)?;
+            }
+            entry.token = Some((tokens.access_token.clone(), tokens.expires_at_ms));
+            return Ok(tokens.access_token);
         }
-        self.cache(account_id, &tokens);
-        Ok(tokens.access_token)
     }
 
     /// Stores freshly issued tokens (e.g. after interactive sign-in): the refresh token
     /// goes to the secret store, the access token to the in-memory cache.
     pub fn store(&self, account_id: &AccountId, tokens: &TokenSet) -> Result<()> {
+        let mut entries = self.entries();
+        let entry = entries.entry(account_id.clone()).or_default();
         if let Some(refresh_token) = tokens.refresh_token.as_deref() {
             self.secrets
                 .set(&refresh_token_key(account_id), refresh_token)?;
         }
-        self.cache(account_id, tokens);
+        entry.stored_generation = entry.stored_generation.wrapping_add(1);
+        entry.token = Some((tokens.access_token.clone(), tokens.expires_at_ms));
         Ok(())
-    }
-
-    fn cache(&self, account_id: &AccountId, tokens: &TokenSet) {
-        self.entries().entry(account_id.clone()).or_default().token =
-            Some((tokens.access_token.clone(), tokens.expires_at_ms));
     }
 
     /// Drops the cached access token so the next call refreshes.
@@ -147,19 +152,22 @@ impl TokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::microsoft::{Endpoints, client_with};
+    use crate::model::ProviderKind;
     use crate::secrets::MemorySecrets;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn manager(server: &MockServer, secrets: Arc<MemorySecrets>) -> TokenManager {
-        TokenManager::with_endpoints(
-            secrets,
-            "test-client".into(),
+        let client = client_with(
+            "test-client",
             Endpoints {
                 authority: format!("{}/common", server.uri()),
                 graph: format!("{}/v1.0", server.uri()),
             },
         )
+        .unwrap();
+        TokenManager::new(secrets, HashMap::from([(ProviderKind::Microsoft, client)]))
     }
 
     fn token_response(access: &str, refresh: &str) -> ResponseTemplate {
@@ -201,8 +209,18 @@ mod tests {
                 .as_deref(),
             Some("rt-1")
         );
-        assert_eq!(tm.access_token(&account).await.unwrap(), "at-1");
-        assert_eq!(tm.access_token(&account).await.unwrap(), "at-1");
+        assert_eq!(
+            tm.access_token(&account, ProviderKind::Microsoft)
+                .await
+                .unwrap(),
+            "at-1"
+        );
+        assert_eq!(
+            tm.access_token(&account, ProviderKind::Microsoft)
+                .await
+                .unwrap(),
+            "at-1"
+        );
 
         // Under five minutes left: refresh once, persist the rotated refresh token.
         tm.store(
@@ -214,8 +232,18 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(tm.access_token(&account).await.unwrap(), "at-2");
-        assert_eq!(tm.access_token(&account).await.unwrap(), "at-2");
+        assert_eq!(
+            tm.access_token(&account, ProviderKind::Microsoft)
+                .await
+                .unwrap(),
+            "at-2"
+        );
+        assert_eq!(
+            tm.access_token(&account, ProviderKind::Microsoft)
+                .await
+                .unwrap(),
+            "at-2"
+        );
         assert_eq!(
             secrets
                 .get(&refresh_token_key(&account))
@@ -247,7 +275,7 @@ mod tests {
         let calls = (0..8).map(|_| {
             let tm = tm.clone();
             let account = account.clone();
-            tokio::spawn(async move { tm.access_token(&account).await })
+            tokio::spawn(async move { tm.access_token(&account, ProviderKind::Microsoft).await })
         });
         for result in futures::future::join_all(calls).await {
             assert_eq!(result.unwrap().unwrap(), "at-fresh");
@@ -258,6 +286,63 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("rt-rotated")
+        );
+    }
+
+    #[tokio::test]
+    async fn store_during_refresh_keeps_new_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/common/oauth2/v2.0/token"))
+            .and(body_string_contains("refresh_token=old-refresh"))
+            .respond_with(
+                token_response("stale-access", "stale-rotation")
+                    .set_delay(std::time::Duration::from_secs(1)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let secrets = Arc::new(MemorySecrets::new());
+        let account = AccountId::from("acct".to_string());
+        secrets
+            .set(&refresh_token_key(&account), "old-refresh")
+            .unwrap();
+        let tm = Arc::new(manager(&server, secrets.clone()));
+        let refresh = {
+            let tm = tm.clone();
+            let account = account.clone();
+            tokio::spawn(async move { tm.access_token(&account, ProviderKind::Microsoft).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while server.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!refresh.is_finished());
+        tm.store(
+            &account,
+            &TokenSet {
+                access_token: "new-access".into(),
+                refresh_token: Some("new-refresh".into()),
+                expires_at_ms: now_ms() + 3_600_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(refresh.await.unwrap().unwrap(), "new-access");
+        assert_eq!(
+            secrets
+                .get(&refresh_token_key(&account))
+                .unwrap()
+                .as_deref(),
+            Some("new-refresh")
+        );
+        assert_eq!(
+            tm.access_token(&account, ProviderKind::Microsoft)
+                .await
+                .unwrap(),
+            "new-access"
         );
     }
 
@@ -283,7 +368,12 @@ mod tests {
         )
         .unwrap();
         tm.invalidate(&account);
-        assert_eq!(tm.access_token(&account).await.unwrap(), "at-2");
+        assert_eq!(
+            tm.access_token(&account, ProviderKind::Microsoft)
+                .await
+                .unwrap(),
+            "at-2"
+        );
     }
 
     #[tokio::test]
@@ -291,7 +381,10 @@ mod tests {
         let server = MockServer::start().await;
         let tm = manager(&server, Arc::new(MemorySecrets::new()));
         let err = tm
-            .access_token(&AccountId::from("acct-9".to_string()))
+            .access_token(
+                &AccountId::from("acct-9".to_string()),
+                ProviderKind::Microsoft,
+            )
             .await
             .unwrap_err();
         match err {
@@ -317,9 +410,120 @@ mod tests {
             .set(&refresh_token_key(&account), "rt-dead")
             .unwrap();
         let tm = manager(&server, secrets);
-        match tm.access_token(&account).await.unwrap_err() {
+        match tm
+            .access_token(&account, ProviderKind::Microsoft)
+            .await
+            .unwrap_err()
+        {
             CoreError::NeedsSignIn { account_id } => assert_eq!(account_id, "acct-2"),
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_without_refresh_token_keeps_stored_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=rt-stored"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh", "expires_in": 3600
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let secrets = Arc::new(MemorySecrets::new());
+        let account = AccountId::from("acct".to_string());
+        secrets
+            .set(&refresh_token_key(&account), "rt-stored")
+            .unwrap();
+        let tm = manager(&server, secrets.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                tm.access_token(&account, ProviderKind::Microsoft)
+                    .await
+                    .unwrap(),
+                "fresh"
+            );
+            assert_eq!(
+                secrets
+                    .get(&refresh_token_key(&account))
+                    .unwrap()
+                    .as_deref(),
+                Some("rt-stored")
+            );
+            tm.invalidate(&account);
+        }
+    }
+
+    #[tokio::test]
+    async fn token_manager_selects_provider_client() {
+        let server = MockServer::start().await;
+        let microsoft = client_with(
+            "microsoft-client",
+            Endpoints {
+                authority: format!("{}/common", server.uri()),
+                graph: server.uri(),
+            },
+        )
+        .unwrap();
+        let google = crate::auth::google::client_with(
+            "google-client",
+            "google-secret",
+            &format!("{}/authorize", server.uri()),
+            &format!("{}/google-token", server.uri()),
+        )
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/common/oauth2/v2.0/token"))
+            .and(body_string_contains("client_id=microsoft-client"))
+            .respond_with(token_response("microsoft-access", "microsoft-refresh"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/google-token"))
+            .and(body_string_contains("client_id=google-client"))
+            .and(body_string_contains("client_secret=google-secret"))
+            .respond_with(token_response("google-access", "google-refresh"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let secrets = Arc::new(MemorySecrets::new());
+        let tm = TokenManager::new(
+            secrets.clone(),
+            HashMap::from([
+                (ProviderKind::Microsoft, microsoft),
+                (ProviderKind::Google, google),
+            ]),
+        );
+        for (kind, expected) in [
+            (ProviderKind::Microsoft, "microsoft-access"),
+            (ProviderKind::Google, "google-access"),
+        ] {
+            let account = AccountId::from(kind.as_str().to_string());
+            secrets.set(&refresh_token_key(&account), "stored").unwrap();
+            assert_eq!(tm.access_token(&account, kind).await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_provider_client_is_not_configured() {
+        let tm = TokenManager::new(Arc::new(MemorySecrets::new()), HashMap::new());
+        let account = AccountId::from("acct".to_string());
+        tm.store(
+            &account,
+            &TokenSet {
+                access_token: "cached".into(),
+                refresh_token: None,
+                expires_at_ms: now_ms() + 3_600_000,
+            },
+        )
+        .unwrap();
+        for kind in [ProviderKind::Microsoft, ProviderKind::Google] {
+            let error = tm.access_token(&account, kind).await.unwrap_err();
+            assert!(
+                matches!(error, CoreError::InvalidInput(message) if message == crate::auth::oauth::not_configured(kind))
+            );
         }
     }
 }

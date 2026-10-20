@@ -39,6 +39,7 @@ id_newtype!(MessageId);
 pub enum ProviderKind {
     Imap,
     Microsoft,
+    Google,
 }
 
 impl ProviderKind {
@@ -46,6 +47,7 @@ impl ProviderKind {
         match self {
             Self::Imap => "imap",
             Self::Microsoft => "microsoft",
+            Self::Google => "google",
         }
     }
 
@@ -53,6 +55,7 @@ impl ProviderKind {
         match value {
             "imap" => Ok(Self::Imap),
             "microsoft" => Ok(Self::Microsoft),
+            "google" => Ok(Self::Google),
             other => Err(CoreError::InvalidInput(format!(
                 "unknown provider kind: {other}"
             ))),

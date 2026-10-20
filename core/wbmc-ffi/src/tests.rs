@@ -160,7 +160,7 @@ async fn adding_the_same_imap_account_updates_the_password() {
     assert!(h.core.is_syncing(&first.id));
     assert_eq!(h.core.accounts().len(), 1);
     assert_eq!(h.core.accounts()[0].email, "alice@wbmc.test");
-    assert_eq!(h.core.accounts()[0].display_name, "Alice");
+    assert_eq!(h.core.accounts()[0].display_name, "Renamed");
     assert_ne!(h.core.accounts()[0].status, "needs_sign_in");
     assert_eq!(
         h.secrets.get(&password_key(&id)).unwrap().as_deref(),
@@ -180,6 +180,42 @@ async fn adding_the_same_imap_account_updates_the_password() {
         h.secrets.get(&password_key(&id)).unwrap().as_deref(),
         Some("password")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn re_add_updates_settings() {
+    if !imap_tests_enabled() {
+        return;
+    }
+    let h = harness();
+    let first = h.core.add_imap_account(input("password")).await.unwrap();
+    wait_for_sync(&h.core, &first.id).await;
+
+    let id = AccountId::from(first.id.clone());
+    let guard = h.core.inner.try_begin_sync(&id).expect("old password sync");
+    let generation = h.core.inner.events.generation(&id);
+    let mut again = input("password");
+    again.smtp_port = 2525;
+    again.display_name = "Renamed".into();
+    let updated = h.core.add_imap_account(again).await.unwrap();
+    assert_eq!(updated.id, first.id);
+    assert_eq!(h.core.accounts().len(), 1);
+
+    let stored = h.core.inner.store.accounts().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id.as_str(), first.id);
+    assert_eq!(stored[0].display_name, "Renamed");
+    assert_eq!(stored[0].config["smtp_port"], 2525);
+    assert!(h.core.inner.events.generation(&id) > generation);
+    assert!(h.core.inner.events.sync_is_stale(&id));
+    assert!(!h.core.inner.restart_after_store().contains(&id));
+    h.core.inner.events.emit(CoreEvent::SyncStatus {
+        account_id: id,
+        status: SyncStatus::NeedsSignIn,
+    });
+    assert_eq!(h.core.accounts()[0].status, "idle");
+    drop(guard);
+    wait_for_sync(&h.core, &first.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -283,16 +319,10 @@ async fn sync_account_is_single_flight() {
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_imap_input_is_rejected_without_network() {
     let h = harness();
-    for (field, value) in [
-        ("host", ""),
-        ("username", ""),
-        ("email", ""),
-        ("security", "ssl"),
-    ] {
+    for (field, value) in [("host", ""), ("email", ""), ("security", "ssl")] {
         let mut bad = input("password");
         match field {
             "host" => bad.host = value.into(),
-            "username" => bad.username = value.into(),
             "email" => bad.email = value.into(),
             _ => bad.security = value.into(),
         }
@@ -451,22 +481,118 @@ fn imap_input_debug_redacts_password() {
 }
 
 #[test]
+fn sync_cannot_begin_until_credentials_are_stored() {
+    let h = harness();
+    let id = AccountId::new();
+    h.core.inner.restart_after_store().insert(id.clone());
+    h.core.inner.events.bump_generation(&id);
+    assert!(h.core.inner.try_begin_sync(&id).is_none());
+    assert!(!h.core.is_syncing(id.as_str()));
+    h.core.inner.restart_after_store().remove(&id);
+    let guard = h.core.inner.try_begin_sync(&id).expect("sync after store");
+    drop(guard);
+}
+
+#[test]
+fn new_oauth_account_requires_refresh_token_but_resign_in_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("wbmc.sqlite")).unwrap();
+    let secrets = Arc::new(MemorySecrets::new());
+    let manager = TokenManager::new(secrets.clone(), HashMap::new());
+    for kind in [ProviderKind::Microsoft, ProviderKind::Google] {
+        let mut tokens = wbmc_core::auth::TokenSet {
+            access_token: "access".into(),
+            refresh_token: None,
+            expires_at_ms: i64::MAX,
+        };
+        let email = format!("{}@example.com", kind.as_str());
+        for refresh_token in [None, Some(String::new())] {
+            tokens.refresh_token = refresh_token;
+            let error = save_oauth_account(&store, kind, email.clone(), &tokens, |_| {
+                panic!("must not store tokens")
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, CoreError::InvalidInput(message) if message == "The provider did not return a refresh token; please try signing in again.")
+            );
+            assert!(!store.accounts().unwrap().iter().any(|a| a.kind == kind));
+        }
+        tokens.refresh_token = Some("stored-refresh".into());
+        let first = save_oauth_account(&store, kind, email.clone(), &tokens, |id| {
+            manager.store(id, &tokens)
+        })
+        .unwrap();
+        tokens.refresh_token = None;
+        let again = save_oauth_account(&store, kind, email.to_uppercase(), &tokens, |id| {
+            manager.store(id, &tokens)
+        })
+        .unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(
+            secrets
+                .get(&refresh_token_key(&first.id))
+                .unwrap()
+                .as_deref(),
+            Some("stored-refresh")
+        );
+    }
+}
+
+#[test]
 fn new_microsoft_account_is_rolled_back_when_tokens_fail() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("wbmc.sqlite")).unwrap();
-    let failed = save_microsoft_account(&store, "ms@example.com".into(), |_| {
-        Err(wbmc_core::CoreError::Storage("keychain locked".into()))
-    });
+    let failed = save_oauth_account(
+        &store,
+        wbmc_core::model::ProviderKind::Microsoft,
+        "ms@example.com".into(),
+        &wbmc_core::auth::TokenSet {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at_ms: i64::MAX,
+        },
+        |_| Err(wbmc_core::CoreError::Storage("keychain locked".into())),
+    );
     assert!(failed.is_err());
     assert!(store.accounts().unwrap().is_empty());
 
-    let first = save_microsoft_account(&store, "ms@example.com".into(), |_| Ok(())).unwrap();
-    let again = save_microsoft_account(&store, "MS@example.com".into(), |_| Ok(())).unwrap();
+    let first = save_oauth_account(
+        &store,
+        wbmc_core::model::ProviderKind::Microsoft,
+        "ms@example.com".into(),
+        &wbmc_core::auth::TokenSet {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at_ms: i64::MAX,
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    let again = save_oauth_account(
+        &store,
+        wbmc_core::model::ProviderKind::Microsoft,
+        "MS@example.com".into(),
+        &wbmc_core::auth::TokenSet {
+            access_token: "access".into(),
+            refresh_token: None,
+            expires_at_ms: i64::MAX,
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
     assert_eq!(first.id, again.id);
     // A failed re-sign-in keeps the existing account.
-    let failed_again = save_microsoft_account(&store, "ms@example.com".into(), |_| {
-        Err(wbmc_core::CoreError::Storage("keychain locked".into()))
-    });
+    let failed_again = save_oauth_account(
+        &store,
+        wbmc_core::model::ProviderKind::Microsoft,
+        "ms@example.com".into(),
+        &wbmc_core::auth::TokenSet {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at_ms: i64::MAX,
+        },
+        |_| Err(wbmc_core::CoreError::Storage("keychain locked".into())),
+    );
     assert!(failed_again.is_err());
     assert_eq!(store.accounts().unwrap().len(), 1);
 }
@@ -556,4 +682,539 @@ async fn remove_account_during_sync_leaves_no_residue() {
         h.core.sync_account(account.id.clone()).await,
         Ok(()) | Err(FfiError::NotFound { .. })
     ));
+}
+
+#[tokio::test]
+async fn detect_account_maps_profile() {
+    let h = harness();
+    h.core.set_detect_env(DetectEnv::for_test(
+        Arc::new(wbmc_core::setup::FakeResolver::new()),
+        "",
+        Duration::from_millis(200),
+        [String::new(), String::new()],
+    ));
+    let setup = h.core.detect_account("x@wbmc.test".into()).await.unwrap();
+    assert_eq!(setup.kind, "imap");
+    assert_eq!(setup.provider_name, "WBMC Test");
+    assert!(setup.app_password_url.is_none());
+    let imap = setup.imap.expect("imap settings");
+    assert_eq!(imap.host, "localhost");
+    assert_eq!(imap.port, 3143);
+    assert_eq!(imap.security, "none");
+    // Core already expanded the profile token to the typed address.
+    assert_eq!(imap.username, "x@wbmc.test");
+    assert_eq!(imap.smtp_host, "localhost");
+    assert_eq!(imap.smtp_port, 3025);
+    assert_eq!(imap.smtp_security, "none");
+}
+
+#[tokio::test]
+async fn detect_account_uses_injected_env() {
+    let h = harness();
+    let base = "";
+    h.core.set_detect_env(wbmc_core::setup::DetectEnv::for_test(
+        std::sync::Arc::new(wbmc_core::setup::FakeResolver::new()),
+        base,
+        Duration::from_millis(200),
+        [
+            format!("{base}/autoconfig.{{domain}}"),
+            format!("{base}/well-known.{{domain}}"),
+        ],
+    ));
+    let setup = h
+        .core
+        .detect_account("a@unknown.example".into())
+        .await
+        .unwrap();
+    assert_eq!(setup.kind, "unknown");
+    assert!(setup.imap.is_none());
+    assert!(h.core.accounts().is_empty());
+}
+
+#[test]
+fn imap_login_falls_back_to_email_without_alternatives() {
+    for alternatives in [vec![], vec![" ".into()]] {
+        assert_eq!(
+            imap_login_candidates(" ada@example.com ", &alternatives),
+            ["ada@example.com"]
+        );
+    }
+    assert_eq!(
+        imap_login_candidates("ada@example.com", &["ada".into(), "ada@example.com".into()]),
+        ["ada", "ada@example.com"]
+    );
+}
+
+#[test]
+fn username_candidates_pass_through_literal_logins() {
+    // "email" and "local" are real mailbox names here, not detection tokens.
+    assert_eq!(
+        username_candidates(&["local".into(), "email".into()]),
+        vec!["local".to_string(), "email".to_string()]
+    );
+    assert_eq!(
+        username_candidates(&[
+            " email ".into(),
+            "email".into(),
+            String::new(),
+            "Ada".into(),
+            "Ada".into(),
+        ]),
+        vec!["email".to_string(), "Ada".to_string()]
+    );
+}
+
+#[test]
+fn begin_sign_in_unknown_provider_rejected() {
+    let h = harness();
+    let error = match h.core.begin_sign_in("yahoo".into(), None) {
+        Err(error) => error,
+        Ok(_) => panic!("unknown provider was accepted"),
+    };
+    assert!(
+        matches!(error, FfiError::InvalidInput { ref message } if message == "unknown sign-in provider: yahoo"),
+        "{error:?}"
+    );
+}
+
+fn token_json(access: &str, refresh: &str) -> serde_json::Value {
+    serde_json::json!({
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_in": 3600
+    })
+}
+
+async fn mount_google_sign_in(server: &wiremock::MockServer, profile_email: &str) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(token_json("test-access", "test-refresh")),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/profile"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"emailAddress": profile_email})),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"labels": []})))
+        .mount(server)
+        .await;
+}
+
+fn test_endpoints(server: &wiremock::MockServer) -> TestEndpoints {
+    let base = server.uri();
+    TestEndpoints {
+        microsoft: wbmc_core::auth::Endpoints {
+            authority: format!("{base}/common"),
+            graph: format!("{base}/v1.0"),
+        },
+        google_authorize_url: format!("{base}/authorize"),
+        google_token_url: format!("{base}/token"),
+        gmail_base: format!("{base}/gmail/v1"),
+    }
+}
+
+async fn oauth_harness() -> (Harness, wiremock::MockServer) {
+    let server = wiremock::MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let events = Arc::new(Recorder::default());
+    let secrets = Arc::new(MemorySecrets::new());
+    let core = WbmcCore::with_endpoints(
+        dir.path().to_str().unwrap().to_string(),
+        events.clone(),
+        secrets.clone(),
+        test_endpoints(&server),
+    )
+    .unwrap();
+    (
+        Harness {
+            dir,
+            core,
+            events,
+            secrets,
+        },
+        server,
+    )
+}
+
+fn callback_target(sign_in_url: &str) -> (u16, String) {
+    let url = url::Url::parse(sign_in_url).unwrap();
+    let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let redirect = url::Url::parse(&query["redirect_uri"]).unwrap();
+    (redirect.port().unwrap(), query["state"].clone())
+}
+
+fn post_callback(sign_in_url: &str) {
+    use std::io::{Read, Write};
+    let (port, state) = callback_target(sign_in_url);
+    let request = format!(
+        "GET /?code=auth-code&state={state} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    );
+    let started = Instant::now();
+    loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(mut stream) => {
+                stream.write_all(request.as_bytes()).unwrap();
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf);
+                return;
+            }
+            Err(_) if started.elapsed() < Duration::from_secs(5) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("callback connect: {error}"),
+        }
+    }
+}
+
+async fn finish_google(core: &WbmcCore, hint: &str) -> AccountInfo {
+    let flow = core
+        .begin_sign_in("google".into(), Some(hint.into()))
+        .unwrap();
+    let url = flow.url();
+    let encoded = hint.replace('@', "%40");
+    assert!(
+        url.contains(&format!("login_hint={encoded}"))
+            || url.contains(&format!("login_hint={hint}")),
+        "{url}"
+    );
+    assert!(!url.contains("test-secret"), "{url}");
+    let handle = tokio::spawn(async move { flow.finish().await });
+    let callback = tokio::task::spawn_blocking(move || post_callback(&url));
+    let account = handle.await.unwrap().unwrap();
+    callback.await.unwrap();
+    account
+}
+
+#[tokio::test]
+async fn google_sign_in_saves_real_email_not_hint() {
+    let (h, server) = oauth_harness().await;
+    mount_google_sign_in(&server, "real@gmail.com").await;
+    let account = finish_google(&h.core, "typed@gmail.com").await;
+    assert_eq!(account.kind, "google");
+    assert_eq!(account.email, "real@gmail.com");
+    assert_eq!(h.core.accounts().len(), 1);
+    assert_eq!(h.core.accounts()[0].email, "real@gmail.com");
+    assert_eq!(
+        h.secrets
+            .get(&refresh_token_key(&AccountId::from(account.id)))
+            .unwrap()
+            .as_deref(),
+        Some("test-refresh")
+    );
+}
+
+#[tokio::test]
+async fn google_re_sign_in_reuses_account() {
+    let (h, server) = oauth_harness().await;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let profile_calls = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(token_json("test-access", "test-refresh")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/profile"))
+        .respond_with(move |_: &wiremock::Request| {
+            let email = if profile_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                "real@gmail.com"
+            } else {
+                "Real@Gmail.com"
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"emailAddress": email}))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"labels": []})))
+        .mount(&server)
+        .await;
+
+    let first = finish_google(&h.core, "typed@gmail.com").await;
+    let second = finish_google(&h.core, "other@gmail.com").await;
+    assert_eq!(first.id, second.id);
+    assert_eq!(h.core.accounts().len(), 1);
+    assert_eq!(h.core.accounts()[0].email, "real@gmail.com");
+    assert_eq!(h.core.accounts()[0].kind, "google");
+}
+
+#[tokio::test]
+async fn cancel_aborts_finish() {
+    let (h, _server) = oauth_harness().await;
+    let flow = h.core.begin_sign_in("google".into(), None).unwrap();
+    flow.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), flow.finish())
+        .await
+        .expect("cancel did not finish")
+        .unwrap_err();
+    assert!(
+        matches!(error, FfiError::InvalidInput { ref message } if message == "Sign-in was cancelled."),
+        "{error:?}"
+    );
+
+    let flow = h.core.begin_sign_in("google".into(), None).unwrap();
+    let finishing = flow.clone();
+    let handle = tokio::spawn(async move { finishing.finish().await });
+    tokio::task::yield_now().await;
+    flow.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("cancel did not abort finish")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(error, FfiError::InvalidInput { ref message } if message == "Sign-in was cancelled."),
+        "{error:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unified_messages_include_account_id() {
+    if !imap_tests_enabled() {
+        return;
+    }
+    let h = harness();
+    let alice = h.core.add_imap_account(input("password")).await.unwrap();
+    wait_for_sync(&h.core, &alice.id).await;
+    let mut bob_input = input("password");
+    bob_input.email = "bob@wbmc.test".into();
+    bob_input.display_name = "Bob".into();
+    bob_input.username = "bob@wbmc.test".into();
+    let bob = h.core.add_imap_account(bob_input).await.unwrap();
+    wait_for_sync(&h.core, &bob.id).await;
+    smtp_send("alice@wbmc.test", "bob@wbmc.test", "Hello Bob");
+    h.core.sync_account(bob.id.clone()).await.unwrap();
+
+    let rows = h.core.unified_messages(0, 2_000);
+    assert!(
+        rows.iter().any(|row| row.account_id == alice.id),
+        "alice missing from unified inbox"
+    );
+    assert!(
+        rows.iter().any(|row| row.account_id == bob.id),
+        "bob missing from unified inbox"
+    );
+    let inbox = inbox(&h.core, &alice.id);
+    let folder_rows = h.core.messages(inbox.id, 0, 10);
+    assert!(!folder_rows.is_empty());
+    assert!(folder_rows.iter().all(|row| row.account_id == alice.id));
+}
+
+fn smtp_send(from: &str, to: &str, subject: &str) {
+    use std::io::{Read, Write};
+    let port = env_port("WBMC_SMTP_PORT", 3025);
+    let host = imap_host();
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut banner = [0_u8; 256];
+    let _ = stream.read(&mut banner);
+    let body = format!(
+        "EHLO localhost\r\nMAIL FROM:<{from}>\r\nRCPT TO:<{to}>\r\nDATA\r\n\
+         From: {from}\r\nTo: {to}\r\nSubject: {subject}\r\n\
+         Date: Tue, 20 Oct 2026 15:00:00 +0000\r\n\r\n{subject}\r\n.\r\nQUIT\r\n"
+    );
+    stream.write_all(body.as_bytes()).unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.contains("250") || text.contains("354"),
+        "smtp rejected the message: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_username_tries_detected_alternative() {
+    if !imap_tests_enabled() {
+        return;
+    }
+    let h = harness();
+    let mut blank = input("password");
+    blank.username.clear();
+    let account = h.core.add_imap_account(blank).await.unwrap();
+    assert_eq!(account.email, "alice@wbmc.test");
+    let stored = h.core.inner.store.accounts().unwrap();
+    assert_eq!(stored[0].config["username"], "alice@wbmc.test");
+    wait_for_sync(&h.core, &account.id).await;
+}
+
+#[tokio::test]
+async fn resign_in_during_failing_sync_ends_idle() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let (h, server) = oauth_harness().await;
+    // First code exchange is the original sign-in. Everything after that, including
+    // refresh, succeeds with the new access token.
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(move |_: &wiremock::Request| {
+            let call = token_calls.fetch_add(1, Ordering::SeqCst);
+            let (access, refresh) = if call == 0 {
+                ("old-access", "old-refresh")
+            } else {
+                ("new-access", "new-refresh")
+            };
+            ResponseTemplate::new(200).set_body_json(token_json(access, refresh))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"emailAddress": "real@gmail.com", "historyId": "100"}),
+        ))
+        .mount(&server)
+        .await;
+    let inbox = serde_json::json!({"labels":[
+        {"id":"INBOX","name":"INBOX","type":"system"}
+    ]});
+    // Held open across re-sign-in so the stale sync emits Syncing{done} afterwards.
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .and(header("authorization", "Bearer old-access"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(5))
+                .set_body_json(inbox.clone()),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(inbox))
+        .with_priority(5)
+        .mount(&server)
+        .await;
+    let message_lists = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/messages"))
+        .respond_with(move |_: &wiremock::Request| {
+            let call = message_lists.fetch_add(1, Ordering::SeqCst);
+            let body = if call == 0 {
+                serde_json::json!({"messages":[{"id":"m1"}]})
+            } else {
+                serde_json::json!({"messages":[]})
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/messages/m1"))
+        .and(query_param("format", "metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "m1",
+            "internalDate": "1700000000123",
+            "labelIds": ["INBOX"],
+            "snippet": "hi",
+            "payload": {"headers": [{"name": "Subject", "value": "Hi"}]}
+        })))
+        .mount(&server)
+        .await;
+    // After the progress event, the stale sync fails. The fresh sync lists no messages.
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/messages/m1"))
+        .and(query_param("format", "raw"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let account = finish_google(&h.core, "typed@gmail.com").await;
+    let started = Instant::now();
+    loop {
+        let requests = server.received_requests().await.expect("request log");
+        let labels_in_flight = requests.iter().any(|request| {
+            request.url.path() == "/gmail/v1/users/me/labels"
+                && request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Bearer old-access")
+        });
+        if labels_in_flight {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stale sync did not request labels"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let again = finish_google(&h.core, "typed@gmail.com").await;
+    assert_eq!(again.id, account.id);
+    assert!(
+        h.core.is_syncing(&account.id),
+        "stale sync ended before re-sign-in returned"
+    );
+    let during_sign_in = server.received_requests().await.expect("request log");
+    assert!(
+        !during_sign_in
+            .iter()
+            .any(|request| request.url.path() == "/gmail/v1/users/me/messages"),
+        "stale sync listed messages before re-sign-in returned"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = h
+            .core
+            .accounts()
+            .first()
+            .map(|account| account.status.clone());
+        let syncing = h.core.is_syncing(&account.id);
+        let requests = server.received_requests().await.expect("request log");
+        let saw_new_token = requests.iter().any(|request| {
+            request.url.path() == "/gmail/v1/users/me/labels"
+                && request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Bearer new-access")
+        });
+        if status.as_deref() == Some("idle") && !syncing && saw_new_token {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status={status:?} syncing={syncing} saw_new_token={saw_new_token} events={:?}",
+            h.events.events()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(h.core.accounts().len(), 1);
+    assert_eq!(h.core.accounts()[0].status, "idle");
+    assert!(!h.core.is_syncing(&account.id));
+    assert!(
+        !h.events.events().iter().any(|event| matches!(
+            event,
+            FfiEvent::SyncStatus {
+                status: FfiSyncStatus::NeedsSignIn,
+                ..
+            }
+        )),
+        "stale NeedsSignIn reached the listener: {:?}",
+        h.events.events()
+    );
 }

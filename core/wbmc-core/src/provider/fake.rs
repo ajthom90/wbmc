@@ -27,8 +27,14 @@ struct FakeState {
     reset_next: bool,
     auth_error: bool,
     auth_error_on_fetch: bool,
+    /// `fetch_raw_many` waits forever. Prefetch must give up on its own deadline.
+    hang_fetch_raw_many: bool,
+    #[cfg(test)]
+    reverse_prefetch: bool,
     pages: u32,
     calls: u32,
+    fetch_raw_calls: u32,
+    fetch_raw_many_calls: u32,
 }
 
 impl FakeProvider {
@@ -45,14 +51,33 @@ impl FakeProvider {
                 reset_next: false,
                 auth_error: false,
                 auth_error_on_fetch: false,
+                hang_fetch_raw_many: false,
+                #[cfg(test)]
+                reverse_prefetch: false,
                 pages: 0,
                 calls: 0,
+                fetch_raw_calls: 0,
+                fetch_raw_many_calls: 0,
             }),
         }
     }
 
     pub fn provider_calls(&self) -> u32 {
         self.state.lock().expect("fake state poisoned").calls
+    }
+
+    pub fn fetch_raw_calls(&self) -> u32 {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .fetch_raw_calls
+    }
+
+    pub fn fetch_raw_many_calls(&self) -> u32 {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .fetch_raw_many_calls
     }
 
     /// Fail sync calls after this many successful pages, until explicitly cleared.
@@ -93,6 +118,22 @@ impl FakeProvider {
             .lock()
             .expect("fake state poisoned")
             .auth_error_on_fetch = auth_error;
+    }
+
+    /// The next `fetch_raw_many` calls never return.
+    pub fn set_hang_fetch_raw_many(&self, hang: bool) {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .hang_fetch_raw_many = hang;
+    }
+
+    #[cfg(test)]
+    pub fn set_reverse_prefetch(&self, reverse: bool) {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .reverse_prefetch = reverse;
     }
 
     pub fn set_messages(&self, folder_remote_id: &str, messages: Vec<RemoteMessage>) {
@@ -186,33 +227,101 @@ impl MailProvider for FakeProvider {
     }
 
     async fn fetch_raw(&self, folder_remote_id: &str, message_remote_id: &str) -> Result<Vec<u8>> {
+        note_fetch(self, false);
         let state = self.begin_call()?;
-        if state.auth_error_on_fetch {
-            return Err(CoreError::NeedsSignIn {
-                account_id: "fake".into(),
-            });
-        }
-        if state
-            .fetch_errors
-            .contains(&(folder_remote_id.into(), message_remote_id.into()))
-        {
-            return Err(CoreError::Network("injected body failure".into()));
-        }
-        let message = state
-            .messages
-            .get(folder_remote_id)
-            .and_then(|messages| {
-                messages
-                    .iter()
-                    .find(|message| message.remote_id == message_remote_id)
-            })
-            .ok_or_else(|| CoreError::NotFound(format!("remote message {message_remote_id}")))?;
-        Ok(format!(
-            "From: {}\r\nSubject: {}\r\nContent-Type: text/plain\r\n\r\n{}",
-            message.from.email, message.subject, message.snippet
-        )
-        .into_bytes())
+        raw_message(&state, folder_remote_id, message_remote_id)
     }
+
+    async fn fetch_raw_many(
+        &self,
+        folder_remote_id: &str,
+        message_remote_ids: &[String],
+    ) -> Vec<(String, Result<Vec<u8>>)> {
+        let hang = self
+            .state
+            .lock()
+            .expect("fake state poisoned")
+            .hang_fetch_raw_many;
+        if hang {
+            note_fetch(self, true);
+            return std::future::pending().await;
+        }
+        note_fetch(self, true);
+        let state = match self.begin_call() {
+            Ok(state) => state,
+            Err(error) => {
+                return message_remote_ids
+                    .iter()
+                    .map(|id| (id.clone(), Err(error.clone())))
+                    .collect();
+            }
+        };
+        if state.auth_error_on_fetch {
+            return message_remote_ids
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        Err(CoreError::NeedsSignIn {
+                            account_id: "fake".into(),
+                        }),
+                    )
+                })
+                .collect();
+        }
+        let results = message_remote_ids
+            .iter()
+            .map(|id| (id.clone(), raw_message(&state, folder_remote_id, id)))
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        let results = if state.reverse_prefetch {
+            results.into_iter().rev().collect()
+        } else {
+            results
+        };
+        results
+    }
+}
+
+fn note_fetch(provider: &FakeProvider, many: bool) {
+    let mut state = provider.state.lock().expect("fake state poisoned");
+    if many {
+        state.fetch_raw_many_calls = state.fetch_raw_many_calls.saturating_add(1);
+    } else {
+        state.fetch_raw_calls = state.fetch_raw_calls.saturating_add(1);
+    }
+}
+
+fn raw_message(
+    state: &FakeState,
+    folder_remote_id: &str,
+    message_remote_id: &str,
+) -> Result<Vec<u8>> {
+    if state.auth_error_on_fetch {
+        return Err(CoreError::NeedsSignIn {
+            account_id: "fake".into(),
+        });
+    }
+    if state
+        .fetch_errors
+        .contains(&(folder_remote_id.into(), message_remote_id.into()))
+    {
+        return Err(CoreError::Network("injected body failure".into()));
+    }
+    let message = state
+        .messages
+        .get(folder_remote_id)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message.remote_id == message_remote_id)
+        })
+        .ok_or_else(|| CoreError::NotFound(format!("remote message {message_remote_id}")))?;
+    Ok(format!(
+        "From: {}\r\nSubject: {}\r\nContent-Type: text/plain\r\n\r\n{}",
+        message.from.email, message.subject, message.snippet
+    )
+    .into_bytes())
 }
 
 fn message_page(
@@ -264,7 +373,7 @@ fn page_offset(cursor: Option<FolderSyncState>) -> Result<usize> {
         }) => offset
             .parse()
             .map_err(|error| CoreError::Protocol(format!("invalid fake cursor: {error}"))),
-        Some(FolderSyncState::Imap { .. }) => {
+        Some(FolderSyncState::Imap { .. } | FolderSyncState::Gmail { .. }) => {
             Err(CoreError::Protocol("expected a fake Graph cursor".into()))
         }
     }
