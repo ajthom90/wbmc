@@ -248,14 +248,38 @@ impl SyncEngine {
         provider: &dyn MailProvider,
         inbox: &FolderId,
     ) -> Result<()> {
+        let mut pending = Vec::new();
         for message in self.store.messages(inbox, 0, PAGE_SIZE)? {
-            match self.body(account, provider, &message.id).await {
-                Err(error @ CoreError::NeedsSignIn { .. }) => return Err(error),
+            if self.cached_body(account, &message.id)?.is_none() {
+                pending.push(message);
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let folder = self
+            .store
+            .folders(&account.id)?
+            .into_iter()
+            .find(|folder| folder.id == *inbox)
+            .ok_or_else(|| CoreError::NotFound(format!("folder {}", inbox.as_str())))?;
+        let ids: Vec<String> = pending
+            .iter()
+            .map(|message| message.remote_id.clone())
+            .collect();
+        let fetched = provider.fetch_raw_many(&folder.remote_id, &ids).await;
+        let mut needs_sign_in = None;
+        for (message, (_remote_id, result)) in pending.iter().zip(fetched) {
+            match result {
+                Ok(raw) => self.bodies.put(&account.id, &message.id, &raw)?,
+                Err(error @ CoreError::NeedsSignIn { .. }) => needs_sign_in = Some(error),
                 Err(error) => {
                     tracing::warn!("body prefetch failed for {}: {error}", message.id.as_str());
                 }
-                Ok(_) => {}
             }
+        }
+        if let Some(error) = needs_sign_in {
+            return Err(error);
         }
         Ok(())
     }
@@ -493,8 +517,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // list + 5 pages + exactly 200 body fetches.
-        assert_eq!(provider.provider_calls(), 206);
+        // list + 5 pages + one batched prefetch of the newest 200.
+        assert_eq!(provider.provider_calls(), 7);
     }
 
     #[tokio::test]
@@ -511,8 +535,8 @@ mod tests {
             h.statuses().last(),
             Some(SyncStatus::Error { .. })
         ));
-        // list + the successful page + the failed page, then a prefetch of the 200 stored messages.
-        assert_eq!(provider.provider_calls(), 203);
+        // list + the successful page + the failed page, then one batched prefetch.
+        assert_eq!(provider.provider_calls(), 4);
         provider.set_fail_after_pages(None);
         h.engine.sync_account(&h.account, &provider).await.unwrap();
         let after = h.store.messages(&inbox.id, 0, 500).unwrap();
@@ -526,8 +550,8 @@ mod tests {
             );
         }
         assert_eq!(h.statuses().last(), Some(&SyncStatus::Idle));
-        // A resumed pass takes two pages, not three.
-        assert_eq!(provider.provider_calls(), 206);
+        // A resumed pass takes two pages, not three. The newest 200 are already cached.
+        assert_eq!(provider.provider_calls(), 7);
     }
 
     #[tokio::test]
@@ -686,6 +710,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefetch_uses_one_batch() {
+        let h = Harness::new();
+        let provider = provider(200, FolderRole::Inbox);
+        h.engine.sync_account(&h.account, &provider).await.unwrap();
+        assert_eq!(provider.fetch_raw_many_calls(), 1);
+        assert_eq!(provider.fetch_raw_calls(), 0);
+        let rows = h.store.messages(&h.folder("inbox").id, 0, 200).unwrap();
+        assert_eq!(rows.len(), 200);
+        for row in &rows {
+            assert!(
+                h.bodies.get(&h.account.id, &row.id).unwrap().is_some(),
+                "missing body for {}",
+                row.remote_id
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn prefetch_stops_on_needs_sign_in() {
         let h = Harness::new();
         let provider = provider(3, FolderRole::Inbox);
@@ -693,7 +735,7 @@ mod tests {
 
         let result = h.engine.sync_account(&h.account, &provider).await;
 
-        // One list call, one page, and exactly one fetch_raw attempt.
+        // One list call, one page, and one batched prefetch that needs sign-in.
         assert_eq!(provider.provider_calls(), 3);
         assert!(matches!(result, Err(CoreError::NeedsSignIn { .. })));
         assert_eq!(
@@ -840,7 +882,8 @@ mod tests {
             );
         }
         assert_eq!(h.statuses().last(), Some(&SyncStatus::Idle));
-        assert_eq!(provider.provider_calls(), 5);
+        // list + one page + one batched prefetch.
+        assert_eq!(provider.provider_calls(), 3);
     }
 
     #[tokio::test]

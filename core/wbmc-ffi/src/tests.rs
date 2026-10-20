@@ -160,7 +160,7 @@ async fn adding_the_same_imap_account_updates_the_password() {
     assert!(h.core.is_syncing(&first.id));
     assert_eq!(h.core.accounts().len(), 1);
     assert_eq!(h.core.accounts()[0].email, "alice@wbmc.test");
-    assert_eq!(h.core.accounts()[0].display_name, "Alice");
+    assert_eq!(h.core.accounts()[0].display_name, "Renamed");
     assert_ne!(h.core.accounts()[0].status, "needs_sign_in");
     assert_eq!(
         h.secrets.get(&password_key(&id)).unwrap().as_deref(),
@@ -180,6 +180,30 @@ async fn adding_the_same_imap_account_updates_the_password() {
         h.secrets.get(&password_key(&id)).unwrap().as_deref(),
         Some("password")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn re_add_updates_settings() {
+    if !imap_tests_enabled() {
+        return;
+    }
+    let h = harness();
+    let first = h.core.add_imap_account(input("password")).await.unwrap();
+    wait_for_sync(&h.core, &first.id).await;
+
+    let mut again = input("password");
+    again.smtp_port = 2525;
+    again.display_name = "Renamed".into();
+    let updated = h.core.add_imap_account(again).await.unwrap();
+    assert_eq!(updated.id, first.id);
+    assert_eq!(h.core.accounts().len(), 1);
+
+    let stored = h.core.inner.store.accounts().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id.as_str(), first.id);
+    assert_eq!(stored[0].display_name, "Renamed");
+    assert_eq!(stored[0].config["smtp_port"], 2525);
+    wait_for_sync(&h.core, &first.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

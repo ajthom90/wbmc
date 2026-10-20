@@ -583,13 +583,23 @@ impl Inner {
             }))
         })
         .await?;
-        if let Some(account) = existing {
-            // Same mailbox: keep the id and replace the password. A second row would
-            // sync in parallel and duplicate every folder.
+        if let Some(mut account) = existing {
+            // Same mailbox: keep the id, replace the password, and store the new
+            // settings. A second row would sync in parallel and duplicate every folder.
+            account.display_name = display_name;
+            account.config = serde_json::to_value(&config).map_err(|error| FfiError::Storage {
+                message: error.to_string(),
+            })?;
             let secrets = self.secrets.clone();
+            let store = self.store.clone();
             let key = password_key(&account.id);
             let password = input.password;
-            blocking(move || secrets.set(&key, &password)).await?;
+            let saved = account.clone();
+            blocking(move || {
+                secrets.set(&key, &password)?;
+                store.update_account(&saved)
+            })
+            .await?;
             self.events.set_status(&account.id, "idle");
             self.events.emit(CoreEvent::AccountsChanged);
             self.spawn_sync(&account.id);

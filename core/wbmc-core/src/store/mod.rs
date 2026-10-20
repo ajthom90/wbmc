@@ -87,6 +87,28 @@ impl Store {
         Ok(())
     }
 
+    /// Updates the kind-independent columns (`email`, `display_name`, `config`).
+    pub fn update_account(&self, account: &Account) -> Result<()> {
+        let conn = self.lock()?;
+        let config = json_text(&account.config)?;
+        let changed = conn.execute(
+            "UPDATE accounts SET email = ?2, display_name = ?3, config = ?4 WHERE id = ?1",
+            params![
+                account.id.as_str(),
+                account.email,
+                account.display_name,
+                config,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(CoreError::NotFound(format!(
+                "account {}",
+                account.id.as_str()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(&format!(
@@ -684,6 +706,32 @@ mod tests {
         assert_eq!(tail.len(), 50);
         assert_eq!(tail[0].date_ms, 49);
         assert_eq!(tail.last().unwrap().date_ms, 0);
+    }
+
+    #[test]
+    fn update_account_replaces_email_name_and_config() {
+        let (_dir, store) = temp_store();
+        let original = account();
+        store.insert_account(&original).unwrap();
+        let mut updated = original.clone();
+        updated.kind = ProviderKind::Microsoft;
+        updated.email = "new@example.com".into();
+        updated.display_name = "New Name".into();
+        updated.config = serde_json::json!({"smtp_port": 2525});
+
+        store.update_account(&updated).unwrap();
+
+        let stored = store.accounts().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, original.id);
+        assert_eq!(stored[0].kind, ProviderKind::Imap);
+        assert_eq!(stored[0].email, "new@example.com");
+        assert_eq!(stored[0].display_name, "New Name");
+        assert_eq!(stored[0].config["smtp_port"], 2525);
+
+        let missing = account();
+        let error = store.update_account(&missing).unwrap_err();
+        assert!(matches!(error, crate::CoreError::NotFound(_)), "{error}");
     }
 
     #[test]

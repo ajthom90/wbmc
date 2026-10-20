@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -33,6 +35,10 @@ const SUMMARY_WITH_TEXT: &str =
 /// `imap-proto` rejects. After that fetch fails, snippets are read once on a raw connection.
 const PARTIAL_TEXT: &str = "BODY.PEEK[TEXT]<0.1024>";
 const FLAG_BATCH: usize = 500;
+/// UIDs per `UID FETCH` when reading full bodies. One round trip per chunk,
+/// each under [`COMMAND_TIMEOUT`].
+const BODY_BATCH: usize = 20;
+const BUSY_SERVER: &str = "The mail server is busy or limiting connections; will retry";
 
 /// How the IMAP and SMTP connections are secured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +68,8 @@ pub struct ImapProvider {
     config: ImapConfig,
     password: String,
     connect_timeout: Duration,
+    /// Login attempts. Shared across clones so a test can observe one session.
+    logins: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for ImapProvider {
@@ -78,7 +86,17 @@ impl ImapProvider {
             config,
             password,
             connect_timeout: CONNECT_TIMEOUT,
+            logins: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// How many IMAP logins this provider has started.
+    ///
+    /// Tests use this to prove a batch fetch shares one session. The counter is
+    /// an atomic increment; it is not part of the mail-client API.
+    #[doc(hidden)]
+    pub fn login_count(&self) -> usize {
+        self.logins.load(Ordering::Relaxed)
     }
 
     /// Shortens the TCP, STARTTLS-write, and TLS-handshake deadline. Tests use this
@@ -106,6 +124,7 @@ impl ImapProvider {
     }
 
     async fn login(&self) -> Result<Session<MailStream>> {
+        self.logins.fetch_add(1, Ordering::Relaxed);
         let security = self.config.security;
         let stream = self.open_stream().await?;
         let mut client = Client::new(stream);
@@ -250,6 +269,28 @@ impl MailProvider for ImapProvider {
             fetch_raw(session, folder_remote_id, message_remote_id).await
         })
         .await
+    }
+
+    async fn fetch_raw_many(
+        &self,
+        folder_remote_id: &str,
+        message_remote_ids: &[String],
+    ) -> Vec<(String, Result<Vec<u8>>)> {
+        if message_remote_ids.is_empty() {
+            return Vec::new();
+        }
+        match self
+            .with_session(async |session| {
+                Ok(fetch_bodies(session, folder_remote_id, message_remote_ids).await)
+            })
+            .await
+        {
+            Ok(results) => results,
+            Err(error) => message_remote_ids
+                .iter()
+                .map(|id| (id.clone(), Err(copy_error(&error))))
+                .collect(),
+        }
     }
 }
 
@@ -615,6 +656,96 @@ async fn fetch_raw(
         .iter()
         .find_map(|fetch| fetch.body().map(<[u8]>::to_vec))
         .ok_or_else(|| CoreError::NotFound(message_remote_id.to_string()))
+}
+
+async fn fetch_bodies(
+    session: &mut Session<MailStream>,
+    folder_remote_id: &str,
+    message_remote_ids: &[String],
+) -> Vec<(String, Result<Vec<u8>>)> {
+    let mut slots: Vec<Option<Result<Vec<u8>>>> =
+        (0..message_remote_ids.len()).map(|_| None).collect();
+    let mut pending = Vec::new();
+    for (index, id) in message_remote_ids.iter().enumerate() {
+        match id.parse::<u32>() {
+            Ok(uid) => pending.push((index, uid)),
+            Err(_) => {
+                slots[index] = Some(Err(CoreError::InvalidInput(format!(
+                    "message id {id} is not an IMAP UID"
+                ))));
+            }
+        }
+    }
+    if pending.is_empty() {
+        return finish_bodies(message_remote_ids, slots);
+    }
+    if let Err(error) = examine(session, folder_remote_id).await {
+        for (index, _) in &pending {
+            slots[*index] = Some(Err(copy_error(&error)));
+        }
+        return finish_bodies(message_remote_ids, slots);
+    }
+    for chunk in pending.chunks(BODY_BATCH) {
+        let uids: Vec<u32> = chunk.iter().map(|(_, uid)| *uid).collect();
+        match fetch_query(session, &uid_set(&uids), "BODY.PEEK[]").await {
+            Err(error) => {
+                for (index, _) in chunk {
+                    slots[*index] = Some(Err(copy_error(&error)));
+                }
+            }
+            Ok(fetches) => {
+                let mut bodies: HashMap<u32, Vec<u8>> = HashMap::new();
+                for fetch in fetches {
+                    let Some(uid) = fetch.uid else { continue };
+                    if !chunk.iter().any(|(_, wanted)| *wanted == uid) {
+                        continue;
+                    }
+                    if let Some(body) = fetch.body() {
+                        bodies.insert(uid, body.to_vec());
+                    }
+                }
+                for (index, uid) in chunk {
+                    slots[*index] = Some(match bodies.get(uid) {
+                        Some(body) => Ok(body.clone()),
+                        None => Err(CoreError::NotFound(message_remote_ids[*index].clone())),
+                    });
+                }
+            }
+        }
+    }
+    finish_bodies(message_remote_ids, slots)
+}
+
+fn finish_bodies(
+    ids: &[String],
+    slots: Vec<Option<Result<Vec<u8>>>>,
+) -> Vec<(String, Result<Vec<u8>>)> {
+    ids.iter()
+        .zip(slots)
+        .map(|(id, slot)| {
+            (
+                id.clone(),
+                slot.unwrap_or_else(|| {
+                    Err(CoreError::Protocol(format!(
+                        "missing fetch result for {id}"
+                    )))
+                }),
+            )
+        })
+        .collect()
+}
+
+fn copy_error(error: &CoreError) -> CoreError {
+    match error {
+        CoreError::Network(message) => CoreError::Network(message.clone()),
+        CoreError::Protocol(message) => CoreError::Protocol(message.clone()),
+        CoreError::Storage(message) => CoreError::Storage(message.clone()),
+        CoreError::NeedsSignIn { account_id } => CoreError::NeedsSignIn {
+            account_id: account_id.clone(),
+        },
+        CoreError::NotFound(message) => CoreError::NotFound(message.clone()),
+        CoreError::InvalidInput(message) => CoreError::InvalidInput(message.clone()),
+    }
 }
 
 struct SummaryRow {
@@ -1195,11 +1326,91 @@ fn map_imap(err: async_imap::error::Error) -> CoreError {
 
 fn map_login(err: async_imap::error::Error, username: &str) -> CoreError {
     match err {
-        async_imap::error::Error::No(_) => CoreError::NeedsSignIn {
-            account_id: username.to_string(),
-        },
+        async_imap::error::Error::No(text) => map_login_response(&text, username, true),
+        async_imap::error::Error::Bad(text) => map_login_response(&text, username, false),
         other => map_imap(other),
     }
+}
+
+/// `no_response` is true for `NO` and false for `BAD`.
+///
+/// NeedsSignIn is only a bad password: `NO [AUTHENTICATIONFAILED]`,
+/// `NO [AUTHORIZATIONFAILED]`, or a `NO` with no response code. Throttling
+/// (`[UNAVAILABLE]`, `[LIMIT]`, `[INUSE]`, `[EXPIRED]`, `[SERVERBUG]`, or text
+/// containing "too many" / "try again") is a retryable network error.
+fn map_login_response(raw: &str, username: &str, no_response: bool) -> CoreError {
+    let text = imap_info_text(raw);
+    let code = response_code(&text);
+    let needs_sign_in = || CoreError::NeedsSignIn {
+        account_id: username.to_string(),
+    };
+    if no_response
+        && matches!(
+            code.as_deref(),
+            Some("AUTHENTICATIONFAILED") | Some("AUTHORIZATIONFAILED")
+        )
+    {
+        return needs_sign_in();
+    }
+    let lowered = text.to_ascii_lowercase();
+    let throttled = lowered.contains("too many") || lowered.contains("try again");
+    let other_code = code.is_some() || raw.contains("code: Some(");
+    if other_code || throttled || !no_response {
+        return CoreError::Network(BUSY_SERVER.into());
+    }
+    needs_sign_in()
+}
+
+/// Pulls the human response text out of an `async-imap` `Error::No` / `Bad` string.
+///
+/// Those errors look like `code: None, info: Some("[UNAVAILABLE] Temporary")`.
+/// A string that is already the response text is returned unchanged.
+fn imap_info_text(raw: &str) -> String {
+    const OPEN: &str = "info: Some(\"";
+    if let Some(start) = raw.find(OPEN) {
+        let rest = &raw[start + OPEN.len()..];
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(match next {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        other => other,
+                    });
+                }
+                continue;
+            }
+            if ch == '"' {
+                return out;
+            }
+            out.push(ch);
+        }
+        return out;
+    }
+    if raw.contains("info: None") {
+        return String::new();
+    }
+    raw.trim().to_string()
+}
+
+/// Response code in `[CODE]` at the start of the text, uppercased.
+fn response_code(text: &str) -> Option<String> {
+    let text = text.trim();
+    let text = text
+        .strip_prefix("NO ")
+        .or_else(|| text.strip_prefix("BAD "))
+        .unwrap_or(text)
+        .trim_start();
+    let rest = text.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    let code = &rest[..end];
+    if code.is_empty() || !code.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(code.to_ascii_uppercase())
 }
 
 fn drain(session: &Session<MailStream>) {
@@ -1565,6 +1776,95 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, CoreError::Protocol(_)), "{error}");
+    }
+
+    fn login_no(text: &str) -> async_imap::error::Error {
+        async_imap::error::Error::No(text.into())
+    }
+
+    /// The string `async-imap` actually puts on `Error::No` / `Error::Bad`.
+    fn wrapped_login_text(info: Option<&str>) -> String {
+        let info = match info {
+            Some(info) => format!("Some({info:?})"),
+            None => "None".into(),
+        };
+        format!("code: None, info: {info}")
+    }
+
+    fn assert_needs_sign_in(err: async_imap::error::Error) {
+        match super::map_login(err, "alice@wbmc.test") {
+            CoreError::NeedsSignIn { account_id } => {
+                assert_eq!(account_id, "alice@wbmc.test");
+            }
+            other => panic!("expected NeedsSignIn, got {other}"),
+        }
+    }
+
+    fn assert_busy(err: async_imap::error::Error) {
+        match super::map_login(err, "alice@wbmc.test") {
+            CoreError::Network(message) => {
+                assert_eq!(
+                    message,
+                    "The mail server is busy or limiting connections; will retry"
+                );
+            }
+            other => panic!("expected a retryable network error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn map_login_authentication_failed_needs_sign_in() {
+        assert_needs_sign_in(login_no("[AUTHENTICATIONFAILED] Invalid credentials"));
+        assert_needs_sign_in(login_no("[authenticationfailed] Invalid credentials"));
+        assert_needs_sign_in(login_no(&wrapped_login_text(Some(
+            "[AUTHENTICATIONFAILED] Invalid credentials",
+        ))));
+    }
+
+    #[test]
+    fn map_login_authorization_failed_needs_sign_in() {
+        assert_needs_sign_in(login_no("[AUTHORIZATIONFAILED] Access denied"));
+        assert_needs_sign_in(login_no(&wrapped_login_text(Some(
+            "[AUTHORIZATIONFAILED] Access denied",
+        ))));
+    }
+
+    #[test]
+    fn map_login_bare_no_needs_sign_in() {
+        assert_needs_sign_in(login_no("Login failed"));
+        assert_needs_sign_in(login_no(&wrapped_login_text(None)));
+        assert_needs_sign_in(login_no(&wrapped_login_text(Some("Authentication failed"))));
+    }
+
+    #[test]
+    fn map_login_unavailable_is_network() {
+        assert_busy(login_no("[UNAVAILABLE] Temporary"));
+        assert_busy(login_no("[unavailable] Temporary"));
+        assert_busy(login_no(&wrapped_login_text(Some(
+            "[UNAVAILABLE] Temporary",
+        ))));
+    }
+
+    #[test]
+    fn map_login_limit_is_network() {
+        assert_busy(login_no("[LIMIT]"));
+        assert_busy(login_no(&wrapped_login_text(Some("[LIMIT] over quota"))));
+        assert_busy(login_no("[INUSE] Mailbox locked"));
+        assert_busy(login_no("[EXPIRED] Session expired"));
+        assert_busy(login_no("[SERVERBUG] Internal error"));
+        assert_busy(async_imap::error::Error::Bad(
+            "[SERVERBUG] Internal error".into(),
+        ));
+        assert_busy(async_imap::error::Error::Bad("unknown command".into()));
+    }
+
+    #[test]
+    fn map_login_too_many_connections_is_network() {
+        assert_busy(login_no("Too many simultaneous connections"));
+        assert_busy(login_no(&wrapped_login_text(Some(
+            "Too many simultaneous connections",
+        ))));
+        assert_busy(login_no("Please try again later"));
     }
 
     #[tokio::test]

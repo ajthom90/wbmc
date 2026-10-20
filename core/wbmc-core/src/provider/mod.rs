@@ -96,4 +96,21 @@ pub trait MailProvider: Send + Sync {
     ) -> Result<FolderDelta>;
 
     async fn fetch_raw(&self, folder_remote_id: &str, message_remote_id: &str) -> Result<Vec<u8>>;
+
+    /// Fetches raw RFC 5322 bytes for many messages.
+    ///
+    /// Results are in `message_remote_ids` order. The default calls
+    /// [`fetch_raw`](Self::fetch_raw) once per id. Providers that can batch
+    /// (IMAP) override this.
+    async fn fetch_raw_many(
+        &self,
+        folder_remote_id: &str,
+        message_remote_ids: &[String],
+    ) -> Vec<(String, Result<Vec<u8>>)> {
+        let mut results = Vec::with_capacity(message_remote_ids.len());
+        for id in message_remote_ids {
+            results.push((id.clone(), self.fetch_raw(folder_remote_id, id).await));
+        }
+        results
+    }
 }

@@ -29,6 +29,8 @@ struct FakeState {
     auth_error_on_fetch: bool,
     pages: u32,
     calls: u32,
+    fetch_raw_calls: u32,
+    fetch_raw_many_calls: u32,
 }
 
 impl FakeProvider {
@@ -47,12 +49,28 @@ impl FakeProvider {
                 auth_error_on_fetch: false,
                 pages: 0,
                 calls: 0,
+                fetch_raw_calls: 0,
+                fetch_raw_many_calls: 0,
             }),
         }
     }
 
     pub fn provider_calls(&self) -> u32 {
         self.state.lock().expect("fake state poisoned").calls
+    }
+
+    pub fn fetch_raw_calls(&self) -> u32 {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .fetch_raw_calls
+    }
+
+    pub fn fetch_raw_many_calls(&self) -> u32 {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .fetch_raw_many_calls
     }
 
     /// Fail sync calls after this many successful pages, until explicitly cleared.
@@ -186,32 +204,97 @@ impl MailProvider for FakeProvider {
     }
 
     async fn fetch_raw(&self, folder_remote_id: &str, message_remote_id: &str) -> Result<Vec<u8>> {
+        note_fetch(self, false);
         let state = self.begin_call()?;
-        if state.auth_error_on_fetch {
-            return Err(CoreError::NeedsSignIn {
-                account_id: "fake".into(),
-            });
-        }
-        if state
-            .fetch_errors
-            .contains(&(folder_remote_id.into(), message_remote_id.into()))
-        {
-            return Err(CoreError::Network("injected body failure".into()));
-        }
-        let message = state
-            .messages
-            .get(folder_remote_id)
-            .and_then(|messages| {
-                messages
+        raw_message(&state, folder_remote_id, message_remote_id)
+    }
+
+    async fn fetch_raw_many(
+        &self,
+        folder_remote_id: &str,
+        message_remote_ids: &[String],
+    ) -> Vec<(String, Result<Vec<u8>>)> {
+        note_fetch(self, true);
+        let state = match self.begin_call() {
+            Ok(state) => state,
+            Err(error) => {
+                return message_remote_ids
                     .iter()
-                    .find(|message| message.remote_id == message_remote_id)
-            })
-            .ok_or_else(|| CoreError::NotFound(format!("remote message {message_remote_id}")))?;
-        Ok(format!(
-            "From: {}\r\nSubject: {}\r\nContent-Type: text/plain\r\n\r\n{}",
-            message.from.email, message.subject, message.snippet
-        )
-        .into_bytes())
+                    .map(|id| (id.clone(), Err(copy_error(&error))))
+                    .collect();
+            }
+        };
+        if state.auth_error_on_fetch {
+            return message_remote_ids
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        Err(CoreError::NeedsSignIn {
+                            account_id: "fake".into(),
+                        }),
+                    )
+                })
+                .collect();
+        }
+        message_remote_ids
+            .iter()
+            .map(|id| (id.clone(), raw_message(&state, folder_remote_id, id)))
+            .collect()
+    }
+}
+
+fn note_fetch(provider: &FakeProvider, many: bool) {
+    let mut state = provider.state.lock().expect("fake state poisoned");
+    if many {
+        state.fetch_raw_many_calls = state.fetch_raw_many_calls.saturating_add(1);
+    } else {
+        state.fetch_raw_calls = state.fetch_raw_calls.saturating_add(1);
+    }
+}
+
+fn raw_message(
+    state: &FakeState,
+    folder_remote_id: &str,
+    message_remote_id: &str,
+) -> Result<Vec<u8>> {
+    if state.auth_error_on_fetch {
+        return Err(CoreError::NeedsSignIn {
+            account_id: "fake".into(),
+        });
+    }
+    if state
+        .fetch_errors
+        .contains(&(folder_remote_id.into(), message_remote_id.into()))
+    {
+        return Err(CoreError::Network("injected body failure".into()));
+    }
+    let message = state
+        .messages
+        .get(folder_remote_id)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message.remote_id == message_remote_id)
+        })
+        .ok_or_else(|| CoreError::NotFound(format!("remote message {message_remote_id}")))?;
+    Ok(format!(
+        "From: {}\r\nSubject: {}\r\nContent-Type: text/plain\r\n\r\n{}",
+        message.from.email, message.subject, message.snippet
+    )
+    .into_bytes())
+}
+
+fn copy_error(error: &CoreError) -> CoreError {
+    match error {
+        CoreError::Network(message) => CoreError::Network(message.clone()),
+        CoreError::Protocol(message) => CoreError::Protocol(message.clone()),
+        CoreError::Storage(message) => CoreError::Storage(message.clone()),
+        CoreError::NeedsSignIn { account_id } => CoreError::NeedsSignIn {
+            account_id: account_id.clone(),
+        },
+        CoreError::NotFound(message) => CoreError::NotFound(message.clone()),
+        CoreError::InvalidInput(message) => CoreError::InvalidInput(message.clone()),
     }
 }
 
