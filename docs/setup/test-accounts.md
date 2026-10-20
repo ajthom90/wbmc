@@ -58,7 +58,7 @@ EOT
 chmod 600 ~/.config/wbmc/test.env
 ```
 
-Then `source ~/.config/wbmc/test.env` before running the live tests. Never commit this file, paste the token into an issue, chat, or CI log, or store it inside the repo. If a token leaks, revoke it (sign out all sessions for that test user in the Entra admin center under **Users** > the user > **Revoke sessions**) and capture a new one.
+For Gmail (see section 6) add the Gmail variables the same way. Then `source ~/.config/wbmc/test.env` before running the live tests. Never commit this file, paste the token into an issue, chat, or CI log, or store it inside the repo. If a token leaks, revoke it (sign out all sessions for that test user in the Entra admin center under **Users** > the user > **Revoke sessions**) and capture a new one.
 
 ## 5. Capture a refresh token
 
@@ -70,6 +70,32 @@ This depends on the macOS app, which is not built yet. The steps below are avail
 4. Paste it into `~/.config/wbmc/test.env` as `WBMC_TEST_M365_REFRESH_TOKEN`, then clear the clipboard.
 
 Refresh tokens expire after a long period of inactivity (typically 90 days) or when the user's sessions are revoked or the password changes. If the live tests start failing with an invalid-grant error, repeat this section.
+
+## 6. Gmail test account
+
+Use a dedicated, throwaway Gmail account, never a real person's. Add it under **Test users** in the Google Cloud project ([google-cloud-project.md](google-cloud-project.md)).
+
+| Variable | Value |
+| --- | --- |
+| `WBMC_TEST_GMAIL` | `1` to enable the live Gmail tests; unset or anything else skips them |
+| `WBMC_TEST_GMAIL_USER` | the Gmail address the token belongs to |
+| `WBMC_TEST_GMAIL_REFRESH_TOKEN` | that account's OAuth refresh token |
+
+Capture the token with **Debug** > **Copy refresh token...** in a Debug build of the macOS app, exactly as in section 5 (it works for any account). Store it in `~/.config/wbmc/test.env` and treat it as a secret.
+
+## 7. Optional: Yahoo, AOL and iCloud test accounts
+
+Create throwaway accounts only, each with an **app password** (generated in the provider's security settings; never the real password). Set these variables in `~/.config/wbmc/test.env`; the corresponding live tests skip when they are unset.
+
+| Variable | Value |
+| --- | --- |
+| `WBMC_TEST_YAHOO_USER` / `WBMC_TEST_YAHOO_APP_PASSWORD` | Yahoo address and app password |
+| `WBMC_TEST_AOL_USER` / `WBMC_TEST_AOL_APP_PASSWORD` | AOL address and app password |
+| `WBMC_TEST_ICLOUD_USER` / `WBMC_TEST_ICLOUD_APP_PASSWORD` | iCloud address and app password |
+
+## Rule: test accounts only
+
+Automated tests and AI agents use only the accounts in this document, for every provider. They never touch a real person's mailbox.
 
 ## Sources (Microsoft Learn)
 
