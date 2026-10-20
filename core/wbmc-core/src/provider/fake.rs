@@ -347,7 +347,7 @@ fn page_offset(cursor: Option<FolderSyncState>) -> Result<usize> {
         }) => offset
             .parse()
             .map_err(|error| CoreError::Protocol(format!("invalid fake cursor: {error}"))),
-        Some(FolderSyncState::Imap { .. }) => {
+        Some(FolderSyncState::Imap { .. } | FolderSyncState::Gmail { .. }) => {
             Err(CoreError::Protocol("expected a fake Graph cursor".into()))
         }
     }

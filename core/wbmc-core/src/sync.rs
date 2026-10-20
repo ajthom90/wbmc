@@ -95,6 +95,14 @@ impl SyncEngine {
     async fn sync(&self, account: &Account, provider: &dyn MailProvider) -> Result<()> {
         let remote_folders = call_provider(provider.list_folders()).await?;
         let mut folders = self.upsert_folders(account, remote_folders)?;
+        let remote_ids: Vec<String> = folders
+            .iter()
+            .map(|(_, remote)| remote.remote_id.clone())
+            .collect();
+        self.remove_bodies(
+            account,
+            self.store.delete_folders_not_in(&account.id, &remote_ids)?,
+        )?;
         self.events.emit(CoreEvent::FoldersChanged {
             account_id: account.id.clone(),
         });
@@ -448,6 +456,51 @@ mod tests {
             more: false,
             reset: false,
         }
+    }
+
+    #[tokio::test]
+    async fn deleted_label_folder_removed() {
+        let h = Harness::new();
+        let initial = FakeProvider::new(
+            vec![
+                remote_folder("inbox", FolderRole::Inbox),
+                remote_folder("label", FolderRole::Other),
+            ],
+            HashMap::from([
+                ("inbox".into(), vec![remote_message(1)]),
+                ("label".into(), vec![remote_message(2)]),
+            ]),
+        );
+        h.engine.sync_account(&h.account, &initial).await.unwrap();
+        let label = h.folder("label");
+        let removed = h.store.messages(&label.id, 0, 10).unwrap()[0].id.clone();
+        h.engine.body(&h.account, &initial, &removed).await.unwrap();
+        assert!(h.bodies.get(&h.account.id, &removed).unwrap().is_some());
+        let inbox = h.folder("inbox");
+        let kept = h.store.messages(&inbox.id, 0, 10).unwrap()[0].id.clone();
+        h.events.0.lock().unwrap().clear();
+        let remaining = provider(2, FolderRole::Inbox);
+        h.engine.sync_account(&h.account, &remaining).await.unwrap();
+        let folders = h.store.folders(&h.account.id).unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].id, inbox.id);
+        assert!(h.store.message(&removed).unwrap().is_none());
+        assert!(h.bodies.get(&h.account.id, &removed).unwrap().is_none());
+        assert!(h.store.message(&kept).unwrap().is_some());
+        assert!(h.bodies.get(&h.account.id, &kept).unwrap().is_some());
+        assert!(
+            h.events
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event,
+            CoreEvent::FoldersChanged { account_id } if account_id == &h.account.id))
+        );
+        let empty = FakeProvider::new(vec![], HashMap::new());
+        h.engine.sync_account(&h.account, &empty).await.unwrap();
+        assert!(h.store.folders(&h.account.id).unwrap().is_empty());
+        assert!(h.bodies.get(&h.account.id, &kept).unwrap().is_none());
     }
 
     #[tokio::test]
