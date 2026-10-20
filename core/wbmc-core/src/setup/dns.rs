@@ -188,6 +188,16 @@ fn normalize_host(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// An SRV target is usable only when it is the email domain or a subdomain of it.
+fn srv_host_trusted(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if !super::is_hostname(&host) {
+        return false;
+    }
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
 pub(crate) async fn from_mx(resolver: &dyn Resolver, domain: &str) -> Option<AccountSetup> {
     match resolver.mx(domain).await {
         Ok(hosts) => classify_mx(&hosts),
@@ -219,6 +229,10 @@ pub(crate) async fn from_srv(resolver: &dyn Resolver, domain: &str) -> Option<Ac
     };
     let (host, port) = imap.into_iter().next()?;
     let (smtp_host, smtp_port) = smtp.into_iter().next()?;
+    if !srv_host_trusted(&host, domain) || !srv_host_trusted(&smtp_host, domain) {
+        tracing::debug!(%domain, %host, %smtp_host, "srv target rejected");
+        return None;
+    }
     Some(AccountSetup::Imap {
         provider_name: domain.to_string(),
         config: ImapConfig {
