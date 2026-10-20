@@ -69,3 +69,46 @@ WBMC_SECRETS=memory cargo run --release -p wbmc-ffi --example m1_verify -- --big
 docker compose -p wbmc-dev -f dev/mail/docker-compose.yml --profile big stop dovecot
 WBMC_TEST_DETECT=1 cargo test -p wbmc-core live_detect -- --ignored
 ```
+
+## Known follow-ups (deferred from M2 reviews)
+
+None of these block M2. They are listed so later milestones can pick them up.
+
+- (T1) build.rs rerun-if-changed on a usually-missing file reruns build script every build (watch config dir instead)
+- (T1) build.rs emits rustc-env unescaped; reject secrets containing \n/\r
+- (T1) build.rs hand TOML parser untested; no escapes/quoted keys
+- (T1) test-accounts.md "Sources (Microsoft Learn)" heading now after Gmail sections
+- (T2) body-store put error aborts prefetch (should log+continue)
+- (T2) cached_body reads full bytes for existence check in prefetch
+- (T2) re-add writes keychain before row update
+- (T2) FakeProvider double NeedsSignIn check
+- (T3) microsoft authorize test redirect port check is tautological
+- (T3) start_rejects_empty_client_id setup awkward
+- (T3) loopback serial callback handling can delay real callback (not past timeout)
+- (T6) empty schema_version row treated as v0 (harmless)
+- (T6) no test that STEPS ascend/contiguous
+- (T6) perf test only 40% inbox; sparse-inbox case slower (outside target)
+- (T2) unreachable!() in default fetch_raw_many; map_login raw-string Alert check duplicated
+- (T4) history_404_resets doesn't assert more==true; no engine-level reset→refill no-dup test
+- (T4) reset empties folder before refill succeeds
+- (T4) history loop gathers all pages into one transaction
+- (T4) unparseable internalDate stored as 0
+- (T4) mismatched Gmail states → InvalidInput forever (should reset)
+- (T4) persistent non-token 400 on messages.list page → reset/backfill loop (unlikely)
+- (T5) tests hard-code remembered iCloud values (mx_icloud, live_detect)
+- (T5) no fallback-to-next-source test; FakeResolver has no delay; malformed.xml only truncated
+- (T5) "wbmc.test" hard-coded in profiles.rs to exempt app_password_url
+- (T5) userrealm Managed may include viral tenants (check IsViral?) — unverified
+- (T5) BundledImap/bundled_imap_profiles pub → pub(crate)
+- (T5) no test for chunked body cap without Content-Length
+- (T7) duplicated google mock setup in tests; raw pipelined SMTP helper in tests; cancel test may not hit in-flight path
+- (T7) notify_idle check-then-emit not atomic
+- (T8) no positive control in remoteSubresourceNeverReachesServer (add rulesInstalled expect or plain-WKWebView control)
+- (T8) manual(settings:) payload unused; email field in server settings can change address without re-detect
+- (T8) startOAuth accepts http URLs (core always gives https)
+- (T8) unnecessary @unchecked Sendable in test fakes; needsSignInMessage UI copy in CoreClient.swift
+- (final N1) note_sync_generation after syncing lock release leaves a tiny M5 window— user-triggered sync during a keychain write only; costs one manual Refresh if hit.
+- (final N2) keychain I/O under the shared token-map lock— serialises token lookups across accounts during a keychain call; costs brief UI sync latency with many accounts.
+- (final N3) panic in keychain/store leaves account sync blocked until relaunch— panics there are not expected (errors are Results); costs a relaunch if it ever happens.
+- (final N4) detect_account_uses_injected_env no longer proves injection— test weakness only; costs a missed regression in a test-only path.
+- (final M8) Gmail body prefetch is sequential (default `fetch_raw_many`); add bounded concurrency.
