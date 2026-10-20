@@ -12,8 +12,8 @@ pub use imap::{ImapConfig, ImapProvider, Security};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::Result;
 use crate::model::{Address, FolderRole};
+use crate::{CoreError, Result};
 
 /// A mailbox on the remote account.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,17 +100,89 @@ pub trait MailProvider: Send + Sync {
     /// Fetches raw RFC 5322 bytes for many messages.
     ///
     /// Results are in `message_remote_ids` order. The default calls
-    /// [`fetch_raw`](Self::fetch_raw) once per id. Providers that can batch
-    /// (IMAP) override this.
+    /// [`fetch_raw`](Self::fetch_raw) once per id and stops at the first
+    /// [`CoreError::NeedsSignIn`], repeating that error for the rest.
+    /// Providers that can batch (IMAP) override this.
     async fn fetch_raw_many(
         &self,
         folder_remote_id: &str,
         message_remote_ids: &[String],
     ) -> Vec<(String, Result<Vec<u8>>)> {
         let mut results = Vec::with_capacity(message_remote_ids.len());
-        for id in message_remote_ids {
-            results.push((id.clone(), self.fetch_raw(folder_remote_id, id).await));
+        for (index, id) in message_remote_ids.iter().enumerate() {
+            let result = self.fetch_raw(folder_remote_id, id).await;
+            let signed_out = matches!(result, Err(CoreError::NeedsSignIn { .. }));
+            results.push((id.clone(), result));
+            if signed_out {
+                let error = match &results[index].1 {
+                    Err(error) => error.clone(),
+                    Ok(_) => unreachable!("NeedsSignIn branch"),
+                };
+                for rest in &message_remote_ids[index + 1..] {
+                    results.push((rest.clone(), Err(error.clone())));
+                }
+                break;
+            }
         }
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::{FolderSyncState, MailProvider, RemoteFolder};
+    use crate::{CoreError, Result};
+
+    /// Uses the trait default for `fetch_raw_many`.
+    struct SignInOnFetch {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MailProvider for SignInOnFetch {
+        async fn list_folders(&self) -> Result<Vec<RemoteFolder>> {
+            Ok(Vec::new())
+        }
+
+        async fn sync_folder(
+            &self,
+            _folder: &RemoteFolder,
+            _state: Option<FolderSyncState>,
+            _page_size: u32,
+        ) -> Result<super::FolderDelta> {
+            Err(CoreError::Protocol("unused".into()))
+        }
+
+        async fn fetch_raw(
+            &self,
+            _folder_remote_id: &str,
+            _message_remote_id: &str,
+        ) -> Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(CoreError::NeedsSignIn {
+                account_id: "acct".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_raw_many_stops_after_needs_sign_in() {
+        let provider = SignInOnFetch {
+            calls: AtomicUsize::new(0),
+        };
+        let ids = vec!["1".into(), "2".into(), "3".into()];
+        let results = provider.fetch_raw_many("inbox", &ids).await;
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(results.len(), 3);
+        for (_id, result) in results {
+            match result {
+                Err(CoreError::NeedsSignIn { account_id }) => assert_eq!(account_id, "acct"),
+                other => panic!("expected NeedsSignIn, got {other:?}"),
+            }
+        }
     }
 }

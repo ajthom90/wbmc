@@ -27,6 +27,8 @@ struct FakeState {
     reset_next: bool,
     auth_error: bool,
     auth_error_on_fetch: bool,
+    /// `fetch_raw_many` waits forever. Prefetch must give up on its own deadline.
+    hang_fetch_raw_many: bool,
     pages: u32,
     calls: u32,
     fetch_raw_calls: u32,
@@ -47,6 +49,7 @@ impl FakeProvider {
                 reset_next: false,
                 auth_error: false,
                 auth_error_on_fetch: false,
+                hang_fetch_raw_many: false,
                 pages: 0,
                 calls: 0,
                 fetch_raw_calls: 0,
@@ -111,6 +114,14 @@ impl FakeProvider {
             .lock()
             .expect("fake state poisoned")
             .auth_error_on_fetch = auth_error;
+    }
+
+    /// The next `fetch_raw_many` calls never return.
+    pub fn set_hang_fetch_raw_many(&self, hang: bool) {
+        self.state
+            .lock()
+            .expect("fake state poisoned")
+            .hang_fetch_raw_many = hang;
     }
 
     pub fn set_messages(&self, folder_remote_id: &str, messages: Vec<RemoteMessage>) {
@@ -214,13 +225,22 @@ impl MailProvider for FakeProvider {
         folder_remote_id: &str,
         message_remote_ids: &[String],
     ) -> Vec<(String, Result<Vec<u8>>)> {
+        let hang = self
+            .state
+            .lock()
+            .expect("fake state poisoned")
+            .hang_fetch_raw_many;
+        if hang {
+            note_fetch(self, true);
+            return std::future::pending().await;
+        }
         note_fetch(self, true);
         let state = match self.begin_call() {
             Ok(state) => state,
             Err(error) => {
                 return message_remote_ids
                     .iter()
-                    .map(|id| (id.clone(), Err(copy_error(&error))))
+                    .map(|id| (id.clone(), Err(error.clone())))
                     .collect();
             }
         };
@@ -283,19 +303,6 @@ fn raw_message(
         message.from.email, message.subject, message.snippet
     )
     .into_bytes())
-}
-
-fn copy_error(error: &CoreError) -> CoreError {
-    match error {
-        CoreError::Network(message) => CoreError::Network(message.clone()),
-        CoreError::Protocol(message) => CoreError::Protocol(message.clone()),
-        CoreError::Storage(message) => CoreError::Storage(message.clone()),
-        CoreError::NeedsSignIn { account_id } => CoreError::NeedsSignIn {
-            account_id: account_id.clone(),
-        },
-        CoreError::NotFound(message) => CoreError::NotFound(message.clone()),
-        CoreError::InvalidInput(message) => CoreError::InvalidInput(message.clone()),
-    }
 }
 
 fn message_page(
