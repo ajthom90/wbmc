@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use wbmc_core::CoreError;
-use wbmc_core::auth::microsoft::{self, SignIn};
+use wbmc_core::auth::oauth::SignIn;
 use wbmc_core::auth::{Endpoints, TokenManager};
+use wbmc_core::auth::{google, microsoft};
 use wbmc_core::events::{CoreEvent, EventSink, SyncStatus};
 use wbmc_core::mime::parse_message;
 use wbmc_core::model::{
@@ -493,6 +494,7 @@ impl Inner {
                 self.tokens.clone(),
                 Endpoints::default().graph,
             ))),
+            ProviderKind::Google => Err(invalid("Gmail support is not available yet")),
         }
     }
 
@@ -635,7 +637,9 @@ impl Inner {
     }
 
     async fn finish_microsoft(self: Arc<Self>, sign_in: SignIn) -> FfiResult<AccountInfo> {
-        let (tokens, email) = sign_in.finish(SIGN_IN_TIMEOUT).await?;
+        let tokens = sign_in.finish(SIGN_IN_TIMEOUT).await?;
+        let email =
+            microsoft::account_email(&Endpoints::default().graph, &tokens.access_token).await?;
         let store = self.store.clone();
         let manager = self.tokens.clone();
         let account = blocking(move || {
@@ -867,9 +871,12 @@ impl WbmcCore {
             statuses: Mutex::new(HashMap::new()),
             removed: Mutex::new(HashSet::new()),
         });
-        // An unconfigured client id only matters once a Microsoft account is used.
-        let client_id = microsoft::client_id().unwrap_or_default();
-        let tokens = Arc::new(TokenManager::new(secrets.clone(), client_id));
+        let clients = [microsoft::client(), google::client()]
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|client| (client.kind, client))
+            .collect();
+        let tokens = Arc::new(TokenManager::new(secrets.clone(), clients));
         let engine = SyncEngine::new(store.clone(), bodies, events.clone());
         let inner = Arc::new(Inner {
             store,
@@ -926,8 +933,7 @@ impl WbmcCore {
     }
 
     pub fn begin_microsoft_sign_in(&self) -> FfiResult<Arc<MicrosoftSignIn>> {
-        let client_id = microsoft::client_id()?;
-        let sign_in = SignIn::start(&client_id)?;
+        let sign_in = SignIn::start(microsoft::client()?, None)?;
         Ok(Arc::new(MicrosoftSignIn {
             inner: self.inner.clone(),
             url: sign_in.url(),

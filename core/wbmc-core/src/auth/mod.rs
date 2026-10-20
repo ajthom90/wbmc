@@ -2,8 +2,10 @@
 
 //! OAuth sign-in and token lifecycle.
 
+pub mod google;
 pub mod loopback;
 pub mod microsoft;
+pub mod oauth;
 pub mod pkce;
 mod tokens;
 
