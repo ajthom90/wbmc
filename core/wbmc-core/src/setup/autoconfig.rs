@@ -25,13 +25,14 @@ pub(crate) async fn from_realm(
     http: &reqwest::Client,
     realm_base: &str,
     domain: &str,
+    allow_http: bool,
 ) -> Option<AccountSetup> {
     // The local part of the typed address never leaves the machine.
     let url = format!(
         "{}/?user=probe@{domain}&api-version=2.1",
         realm_base.trim_end_matches('/')
     );
-    let body = fetch_body(http, &url).await?;
+    let body = fetch_body(http, &url, allow_http).await?;
     let realm: RealmBody = serde_json::from_str(&body).ok()?;
     match realm.name_space_type.as_deref() {
         Some("Managed") | Some("Federated") => Some(AccountSetup::Microsoft),
@@ -43,9 +44,10 @@ pub(crate) async fn from_ispdb(
     http: &reqwest::Client,
     ispdb_base: &str,
     domain: &str,
+    allow_http: bool,
 ) -> Option<AccountSetup> {
     let url = format!("{}/{}", ispdb_base.trim_end_matches('/'), domain);
-    let body = fetch_body(http, &url).await?;
+    let body = fetch_body(http, &url, allow_http).await?;
     parse_config(&body)
 }
 
@@ -54,10 +56,11 @@ pub(crate) async fn from_domain(
     http: &reqwest::Client,
     templates: &[String; 2],
     domain: &str,
+    allow_http: bool,
 ) -> Option<AccountSetup> {
     for template in templates {
         let url = template.replace("{domain}", domain);
-        let Some(body) = fetch_body(http, &url).await else {
+        let Some(body) = fetch_body(http, &url, allow_http).await else {
             continue;
         };
         if let Some(setup) = parse_config(&body) {
@@ -67,11 +70,20 @@ pub(crate) async fn from_domain(
     None
 }
 
-async fn fetch_body(http: &reqwest::Client, url: &str) -> Option<String> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
+fn url_allowed(url: &str, allow_http: bool) -> bool {
+    let bytes = url.as_bytes();
+    if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
+        return true;
+    }
+    allow_http && bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://")
+}
+
+async fn fetch_body(http: &reqwest::Client, url: &str, allow_http: bool) -> Option<String> {
+    if !url_allowed(url, allow_http) {
+        tracing::debug!(url, "autoconfig url scheme rejected");
         return None;
     }
-    let response = match http.get(url).send().await {
+    let mut response = match http.get(url).send().await {
         Ok(response) => response,
         Err(err) => {
             tracing::debug!(url, %err, "autoconfig fetch failed");
@@ -82,18 +94,30 @@ async fn fetch_body(http: &reqwest::Client, url: &str) -> Option<String> {
         tracing::debug!(url, status = %response.status(), "autoconfig fetch missed");
         return None;
     }
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::debug!(url, %err, "autoconfig body failed");
-            return None;
-        }
-    };
-    if bytes.len() > MAX_BODY {
-        tracing::debug!(url, len = bytes.len(), "autoconfig body too large");
+    if let Some(len) = response.content_length()
+        && len > MAX_BODY as u64
+    {
+        tracing::debug!(url, len, "autoconfig body too large");
         return None;
     }
-    String::from_utf8(bytes.to_vec()).ok()
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > MAX_BODY {
+                    tracing::debug!(url, "autoconfig body too large");
+                    return None;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(err) => {
+                tracing::debug!(url, %err, "autoconfig body failed");
+                return None;
+            }
+        }
+    }
+    String::from_utf8(body).ok()
 }
 
 #[derive(Clone)]
@@ -277,7 +301,7 @@ fn commit(draft: &mut Option<Draft>, display: &mut String, field: Field, text: &
 }
 
 fn build_server(draft: &Draft) -> Option<Built> {
-    if draft.host.is_empty() {
+    if !super::is_hostname(&draft.host) {
         return None;
     }
     let port = draft.port.parse().ok()?;
