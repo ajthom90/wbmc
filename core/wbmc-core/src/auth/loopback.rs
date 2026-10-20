@@ -2,7 +2,7 @@
 
 //! One-shot loopback HTTP listener that receives the OAuth redirect (RFC 8252 §7.3).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +21,7 @@ const PER_CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct Loopback {
     listener: std::net::TcpListener,
+    listener_v6: Option<std::net::TcpListener>,
     port: u16,
 }
 
@@ -30,27 +31,58 @@ impl Loopback {
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(network_error)?;
         listener.set_nonblocking(true).map_err(network_error)?;
         let port = listener.local_addr().map_err(network_error)?.port();
-        Ok(Self { listener, port })
+        let listener_v6 = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, port))
+            .and_then(|listener| {
+                listener.set_nonblocking(true)?;
+                Ok(listener)
+            })
+            .ok();
+        Ok(Self {
+            listener,
+            listener_v6,
+            port,
+        })
     }
 
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// The redirect URI registered for public clients: `http://localhost:{port}`.
-    pub fn redirect_uri(&self) -> String {
-        format!("http://localhost:{}", self.port)
+    /// The redirect URI for the provider's loopback host.
+    pub fn redirect_uri(&self, host: &str) -> String {
+        format!("http://{host}:{}", self.port)
     }
 
     /// Waits for the redirect on `/`, checks `state`, and returns the authorization code.
     ///
     /// Requests for other paths (e.g. `/favicon.ico`), non-GET methods, and malformed or
     /// oversized requests get an error status and are otherwise ignored until `timeout`.
-    pub async fn wait_for_code(self, expected_state: &str, timeout: Duration) -> Result<String> {
+    pub async fn wait_for_code(
+        self,
+        expected_state: &str,
+        timeout: Duration,
+    ) -> Result<(String, Responder)> {
         let listener = TcpListener::from_std(self.listener).map_err(network_error)?;
+        let listener_v6 = self
+            .listener_v6
+            .map(TcpListener::from_std)
+            .transpose()
+            .map_err(network_error)?;
         let deadline = Instant::now() + timeout;
         loop {
-            let stream = match tokio::time::timeout_at(deadline, listener.accept()).await {
+            let stream = match tokio::time::timeout_at(deadline, async {
+                tokio::select! {
+                    result = listener.accept() => result,
+                    result = async {
+                        match &listener_v6 {
+                            Some(listener) => listener.accept().await,
+                            None => std::future::pending().await,
+                        }
+                    } => result,
+                }
+            })
+            .await
+            {
                 Err(_) => {
                     return Err(CoreError::Network(
                         "timed out waiting for the browser to finish sign-in".into(),
@@ -75,7 +107,7 @@ const SUCCESS_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><
 <body><h1>Signed in</h1><p>You can close this window and return to WBMC.</p></body></html>";
 
 const FAILURE_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>WBMC</title></head>\
-<body><h1>Sign-in did not complete</h1><p>You can close this window and try again in WBMC.</p></body></html>";
+<body><p>Sign-in failed. Return to WBMC.</p></body></html>";
 
 const NOT_FOUND_PAGE: &str = "Not found";
 
@@ -84,7 +116,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     expected_state: &str,
     read_deadline: Instant,
-) -> Option<Result<String>> {
+) -> Option<Result<(String, Responder)>> {
     let request = match read_request(&mut stream, read_deadline).await {
         ReadOutcome::Complete(bytes) => bytes,
         ReadOutcome::TooLarge => {
@@ -119,13 +151,13 @@ async fn handle_connection(
         respond(&mut stream, "400 Bad Request", FAILURE_PAGE).await;
         return None;
     };
-    if method != "GET" {
-        respond(&mut stream, "405 Method Not Allowed", NOT_FOUND_PAGE).await;
-        return None;
-    }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path != "/" {
-        respond(&mut stream, "404 Not Found", NOT_FOUND_PAGE).await;
+        respond(&mut stream, "400 Bad Request", FAILURE_PAGE).await;
+        return None;
+    }
+    if method != "GET" {
+        respond(&mut stream, "405 Method Not Allowed", NOT_FOUND_PAGE).await;
         return None;
     }
 
@@ -147,9 +179,8 @@ async fn handle_connection(
     // State is checked first so an unsolicited `?error=` without our state cannot end the wait
     // with a misleading provider error; it still fails closed as a mismatch.
     let result = if state.as_deref() != Some(expected_state) {
-        Err(CoreError::InvalidInput(
-            "sign-in response did not match this request (state mismatch); please try again".into(),
-        ))
+        respond(&mut stream, "400 Bad Request", FAILURE_PAGE).await;
+        return None;
     } else if let Some(error) = error {
         // error_description is deliberately dropped: keep messages short and log-safe.
         Err(CoreError::InvalidInput(format!(
@@ -164,11 +195,30 @@ async fn handle_connection(
             )),
         }
     };
-    match &result {
-        Ok(_) => respond(&mut stream, "200 OK", SUCCESS_PAGE).await,
-        Err(_) => respond(&mut stream, "400 Bad Request", FAILURE_PAGE).await,
+    match result {
+        Ok(code) => Some(Ok((code, Responder { stream }))),
+        Err(error) => {
+            respond(&mut stream, "400 Bad Request", FAILURE_PAGE).await;
+            Some(Err(error))
+        }
     }
-    Some(result)
+}
+
+/// The callback connection, answered after the code exchange completes.
+#[derive(Debug)]
+pub struct Responder {
+    stream: TcpStream,
+}
+
+impl Responder {
+    pub async fn finish(mut self, ok: bool) {
+        let (status, page) = if ok {
+            ("200 OK", SUCCESS_PAGE)
+        } else {
+            ("400 Bad Request", FAILURE_PAGE)
+        };
+        respond(&mut self.stream, status, page).await;
+    }
 }
 
 enum ReadOutcome {
@@ -255,8 +305,11 @@ pub(crate) mod tests {
     ) -> (u16, tokio::task::JoinHandle<Result<String>>) {
         let loopback = Loopback::bind().unwrap();
         let port = loopback.port();
-        let handle =
-            tokio::spawn(async move { loopback.wait_for_code(expected_state, timeout).await });
+        let handle = tokio::spawn(async move {
+            let (code, responder) = loopback.wait_for_code(expected_state, timeout).await?;
+            responder.finish(true).await;
+            Ok(code)
+        });
         (port, handle)
     }
 
@@ -265,7 +318,7 @@ pub(crate) mod tests {
         let loopback = Loopback::bind().unwrap();
         assert_ne!(loopback.port(), 0);
         assert_eq!(
-            loopback.redirect_uri(),
+            loopback.redirect_uri("localhost"),
             format!("http://localhost:{}", loopback.port())
         );
     }
@@ -280,29 +333,30 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn loopback_rejects_wrong_state() {
+    async fn loopback_wrong_state_gets_400_then_accepts_right_state() {
         let (port, handle) = spawn_wait("expected", Duration::from_secs(10));
         let response = send_get(port, "/?code=c&state=forged").await;
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
-        let err = handle.await.unwrap().unwrap_err();
-        assert!(matches!(err, CoreError::InvalidInput(_)), "{err:?}");
+        assert!(!handle.is_finished());
+        send_get(port, "/?code=good&state=expected").await;
+        assert_eq!(handle.await.unwrap().unwrap(), "good");
     }
 
     #[tokio::test]
     async fn loopback_rejects_missing_state() {
         let (port, handle) = spawn_wait("expected", Duration::from_secs(10));
-        send_get(port, "/?code=c").await;
-        assert!(matches!(
-            handle.await.unwrap().unwrap_err(),
-            CoreError::InvalidInput(_)
-        ));
+        let response = send_get(port, "/?code=c").await;
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(!handle.is_finished());
+        send_get(port, "/?code=good&state=expected").await;
+        assert_eq!(handle.await.unwrap().unwrap(), "good");
     }
 
     #[tokio::test]
     async fn loopback_ignores_favicon_then_accepts_callback() {
         let (port, handle) = spawn_wait("s1", Duration::from_secs(10));
         let favicon = send_get(port, "/favicon.ico").await;
-        assert!(favicon.starts_with("HTTP/1.1 404"), "{favicon}");
+        assert!(favicon.starts_with("HTTP/1.1 400"), "{favicon}");
         send_get(port, "/?code=good&state=s1").await;
         assert_eq!(handle.await.unwrap().unwrap(), "good");
     }
@@ -347,5 +401,31 @@ pub(crate) mod tests {
     async fn loopback_times_out() {
         let (_port, handle) = spawn_wait("s1", Duration::from_millis(200));
         assert!(handle.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn loopback_answers_on_ipv6() {
+        let loopback = Loopback::bind().unwrap();
+        if loopback.listener_v6.is_none() {
+            return;
+        }
+        let port = loopback.port();
+        let handle = tokio::spawn(async move {
+            let (code, responder) = loopback
+                .wait_for_code("s1", Duration::from_secs(2))
+                .await
+                .unwrap();
+            responder.finish(true).await;
+            code
+        });
+        let mut stream = TcpStream::connect(("::1", port)).await.unwrap();
+        stream
+            .write_all(b"GET /?code=ipv6&state=s1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(handle.await.unwrap(), "ipv6");
     }
 }

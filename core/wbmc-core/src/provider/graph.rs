@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use super::{FolderDelta, FolderSyncState, MailProvider, RemoteFolder, RemoteMessage};
 use crate::auth::TokenManager;
-use crate::model::{AccountId, Address, FolderRole};
+use crate::model::{AccountId, Address, FolderRole, ProviderKind};
 use crate::{CoreError, Result};
 
 const MAX_RAW_BYTES: usize = 50 * 1024 * 1024;
@@ -165,7 +165,10 @@ impl GraphProvider {
         let mut unauthorized = 0u8;
         let mut delayed = 0u8;
         loop {
-            let token = self.tokens.access_token(&self.account_id).await?;
+            let token = self
+                .tokens
+                .access_token(&self.account_id, ProviderKind::Microsoft)
+                .await?;
             let mut request = self.http.get(url.clone()).bearer_auth(&token);
             if accept_json {
                 request = request.header(reqwest::header::ACCEPT, "application/json");
@@ -724,7 +727,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::auth::Endpoints;
+    use crate::auth::{Endpoints, microsoft};
     use crate::model::{Address, FolderRole};
     use crate::secrets::{MemorySecrets, SecretStore, refresh_token_key};
 
@@ -764,13 +767,17 @@ mod tests {
             .respond_with(token_response("at-1"))
             .mount(&server)
             .await;
-        let tokens = Arc::new(TokenManager::with_endpoints(
-            secrets,
-            "test-client".into(),
+        let client = microsoft::client_with(
+            "test-client",
             Endpoints {
                 authority: format!("{}/common", server.uri()),
                 graph: format!("{}/v1.0", server.uri()),
             },
+        )
+        .unwrap();
+        let tokens = Arc::new(TokenManager::new(
+            secrets,
+            HashMap::from([(ProviderKind::Microsoft, client)]),
         ));
         let slept = Arc::new(Mutex::new(Vec::new()));
         let provider = GraphProvider::with_sleeper(

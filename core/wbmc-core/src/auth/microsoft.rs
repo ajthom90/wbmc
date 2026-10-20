@@ -1,13 +1,9 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Microsoft identity platform sign-in (authorization code + PKCE, loopback redirect)
-//! and token refresh for Microsoft Graph.
+//! Microsoft OAuth configuration and Graph account identity.
 
-use std::time::Duration;
-
-use super::TokenSet;
-use super::loopback::Loopback;
-use super::pkce::Pkce;
+use super::oauth::{OAuthClient, http_client};
+use crate::model::ProviderKind;
 use crate::{CoreError, Result};
 
 /// Delegated scopes requested at sign-in (Ruling R4). Graph scopes are resource-qualified;
@@ -35,7 +31,7 @@ const OAUTH_CLIENTS_TOML: &str = include_str!("../../../../config/oauth-clients.
 
 const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com/common";
 const DEFAULT_GRAPH: &str = "https://graph.microsoft.com/v1.0";
-const NOT_CONFIGURED: &str =
+pub(crate) const NOT_CONFIGURED: &str =
     "Microsoft client ID not configured; see docs/setup/microsoft-entra-app.md";
 
 /// Base URLs for the identity platform and Graph; injectable so tests can use `wiremock`.
@@ -110,252 +106,30 @@ pub fn client_id() -> Result<String> {
     Ok(config()?.client_id)
 }
 
-/// An in-progress interactive sign-in.
-pub struct SignIn {
-    client_id: String,
-    endpoints: Endpoints,
-    loopback: Loopback,
-    pkce: Pkce,
-    state: String,
-    redirect_uri: String,
-    url: String,
+/// Builds the configured Microsoft public client.
+pub fn client() -> Result<OAuthClient> {
+    client_with(&client_id()?, Endpoints::default())
 }
 
-impl std::fmt::Debug for SignIn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SignIn")
-            .field("redirect_uri", &self.redirect_uri)
-            .finish_non_exhaustive()
+/// Builds a Microsoft client with an explicit public ID and endpoints.
+pub fn client_with(client_id: &str, endpoints: Endpoints) -> Result<OAuthClient> {
+    if client_id.trim().is_empty() {
+        return Err(CoreError::InvalidInput(NOT_CONFIGURED.into()));
     }
-}
-
-impl SignIn {
-    /// Starts a sign-in against the configured authority.
-    pub fn start(client_id: &str) -> Result<SignIn> {
-        Self::start_with(client_id, Endpoints::default())
-    }
-
-    /// Starts a sign-in against explicit endpoints.
-    pub fn start_with(client_id: &str, endpoints: Endpoints) -> Result<SignIn> {
-        let client_id = client_id.trim();
-        if client_id.is_empty() {
-            return Err(CoreError::InvalidInput(NOT_CONFIGURED.into()));
-        }
-        let loopback = Loopback::bind()?;
-        let redirect_uri = loopback.redirect_uri();
-        let pkce = Pkce::new()?;
-        let state = super::random_base64url(32)?;
-        let scope = SCOPES.join(" ");
-        let url = url::Url::parse_with_params(
-            &endpoints.authorize_url(),
-            [
-                ("client_id", client_id),
-                ("response_type", "code"),
-                ("redirect_uri", redirect_uri.as_str()),
-                ("response_mode", "query"),
-                ("scope", scope.as_str()),
-                ("state", state.as_str()),
-                ("code_challenge", pkce.challenge.as_str()),
-                ("code_challenge_method", "S256"),
-                ("prompt", "select_account"),
-            ],
-        )
-        .map_err(|e| CoreError::InvalidInput(format!("invalid authority URL: {e}")))?
-        .to_string();
-        Ok(SignIn {
-            client_id: client_id.to_string(),
-            endpoints,
-            loopback,
-            pkce,
-            state,
-            redirect_uri,
-            url,
-        })
-    }
-
-    /// The authorize URL to open in the user's browser.
-    pub fn url(&self) -> String {
-        self.url.clone()
-    }
-
-    /// Waits for the redirect, exchanges the code, and looks up the account's email.
-    pub async fn finish(self, timeout: Duration) -> Result<(TokenSet, String)> {
-        let SignIn {
-            client_id,
-            endpoints,
-            loopback,
-            pkce,
-            state,
-            redirect_uri,
-            url: _,
-        } = self;
-        let code = loopback.wait_for_code(&state, timeout).await?;
-        let http = http_client()?;
-        let scope = SCOPES.join(" ");
-        let tokens = request_tokens(
-            &http,
-            &endpoints,
-            &[
-                ("client_id", client_id.as_str()),
-                ("grant_type", "authorization_code"),
-                ("code", code.as_str()),
-                ("redirect_uri", redirect_uri.as_str()),
-                ("code_verifier", pkce.verifier.as_str()),
-                ("scope", scope.as_str()),
-            ],
-        )
-        .await
-        .map_err(|e| match e {
-            // A rejected code at sign-in is not a stale account; report it as a failed attempt.
-            TokenError::Grant(code) => {
-                CoreError::InvalidInput(format!("sign-in was rejected: {code}"))
-            }
-            TokenError::Other(e) => e,
-        })?;
-        let email = fetch_email(&http, &endpoints, &tokens.access_token).await?;
-        Ok((tokens, email))
-    }
-}
-
-/// Refreshes tokens with the configured authority.
-///
-/// An `invalid_grant` or `interaction_required` response yields `CoreError::NeedsSignIn`
-/// with an empty `account_id`; callers that know the account fill it in.
-pub async fn refresh(client_id: &str, refresh_token: &str) -> Result<TokenSet> {
-    refresh_with(&Endpoints::default(), client_id, refresh_token).await
-}
-
-/// Refreshes tokens against explicit endpoints.
-pub async fn refresh_with(
-    endpoints: &Endpoints,
-    client_id: &str,
-    refresh_token: &str,
-) -> Result<TokenSet> {
-    refresh_using(&http_client()?, endpoints, client_id, refresh_token).await
-}
-
-pub(crate) async fn refresh_using(
-    http: &reqwest::Client,
-    endpoints: &Endpoints,
-    client_id: &str,
-    refresh_token: &str,
-) -> Result<TokenSet> {
-    let scope = SCOPES.join(" ");
-    request_tokens(
-        http,
-        endpoints,
-        &[
-            ("client_id", client_id),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("scope", scope.as_str()),
-        ],
-    )
-    .await
-    .map_err(|e| match e {
-        TokenError::Grant(_) => CoreError::NeedsSignIn {
-            account_id: String::new(),
-        },
-        TokenError::Other(e) => e,
-    })
-}
-
-/// HTTP client for identity and Graph calls (rustls, bounded timeouts, no redirects
-/// that could carry a bearer token elsewhere).
-pub(crate) fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| CoreError::Network(format!("HTTP client: {e}")))
-}
-
-enum TokenError {
-    /// The grant is no longer usable (`invalid_grant` / `interaction_required`).
-    Grant(String),
-    Other(CoreError),
-}
-
-// Not `Debug`: the token response carries secrets.
-#[derive(serde::Deserialize)]
-struct TokenResponse {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    expires_in: Option<serde_json::Value>,
-    error: Option<String>,
-}
-
-/// POSTs a form to the token endpoint. Error messages carry only the OAuth error code.
-async fn request_tokens(
-    http: &reqwest::Client,
-    endpoints: &Endpoints,
-    form: &[(&str, &str)],
-) -> std::result::Result<TokenSet, TokenError> {
-    let response = http
-        .post(endpoints.token_url())
-        .header(reqwest::header::ACCEPT, "application/json")
-        .form(form)
-        .send()
-        .await
-        .map_err(|e| {
-            TokenError::Other(CoreError::Network(format!(
-                "token request: {}",
-                e.without_url()
-            )))
-        })?;
-    let status = response.status();
-    let body = response.bytes().await.map_err(|e| {
-        TokenError::Other(CoreError::Network(format!(
-            "token response: {}",
-            e.without_url()
-        )))
-    })?;
-    let parsed: Option<TokenResponse> = serde_json::from_slice(&body).ok();
-
-    if let Some(error) = parsed.as_ref().and_then(|p| p.error.as_deref()) {
-        let code = sanitize_code(error);
-        return Err(match code.as_str() {
-            "invalid_grant" | "interaction_required" => TokenError::Grant(code),
-            _ => TokenError::Other(CoreError::Protocol(format!("token endpoint error: {code}"))),
-        });
-    }
-    if !status.is_success() {
-        return Err(TokenError::Other(CoreError::Protocol(format!(
-            "token endpoint returned HTTP {}",
-            status.as_u16()
-        ))));
-    }
-    let malformed = |what: &str| {
-        TokenError::Other(CoreError::Protocol(format!(
-            "token endpoint response missing {what}"
-        )))
-    };
-    let parsed = parsed.ok_or_else(|| malformed("JSON body"))?;
-    let access_token = parsed
-        .access_token
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| malformed("access_token"))?;
-    let expires_in = match parsed.expires_in {
-        Some(serde_json::Value::Number(n)) => n.as_i64(),
-        Some(serde_json::Value::String(s)) => s.trim().parse::<i64>().ok(),
-        _ => None,
-    }
-    .filter(|&s| s >= 0)
-    .ok_or_else(|| malformed("expires_in"))?;
-    Ok(TokenSet {
-        access_token,
-        refresh_token: parsed.refresh_token.filter(|t| !t.is_empty()),
-        expires_at_ms: super::now_ms().saturating_add(expires_in.saturating_mul(1000)),
+    Ok(OAuthClient {
+        kind: ProviderKind::Microsoft,
+        client_id: client_id.trim().to_string(),
+        client_secret: None,
+        authorize_url: endpoints.authorize_url(),
+        token_url: endpoints.token_url(),
+        scopes: SCOPES.iter().map(|s| (*s).to_string()).collect(),
+        redirect_host: "localhost",
+        extra_authorize_params: vec![("prompt".into(), "select_account".into())],
     })
 }
 
 /// Looks up the signed-in user's address: `mail`, falling back to `userPrincipalName`.
-async fn fetch_email(
-    http: &reqwest::Client,
-    endpoints: &Endpoints,
-    access_token: &str,
-) -> Result<String> {
+pub async fn account_email(graph_base: &str, access_token: &str) -> Result<String> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Me {
@@ -364,9 +138,9 @@ async fn fetch_email(
     }
     let url = format!(
         "{}/me?$select=mail,userPrincipalName",
-        endpoints.graph.trim_end_matches('/')
+        graph_base.trim_end_matches('/')
     );
-    let response = http
+    let response = http_client()?
         .get(url)
         .bearer_auth(access_token)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -393,18 +167,13 @@ async fn fetch_email(
         })
 }
 
-/// OAuth error codes are short ASCII identifiers; anything else is dropped.
-fn sanitize_code(code: &str) -> String {
-    code.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .take(64)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::TokenSet;
     use crate::auth::loopback::tests::send_get;
+    use crate::auth::oauth::{SignIn, refresh};
+    use std::time::Duration;
     use wiremock::matchers::{body_string_contains, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -444,7 +213,15 @@ mod tests {
 
     #[test]
     fn start_rejects_empty_client_id() {
-        let err = SignIn::start("").unwrap_err();
+        let err = SignIn::start(
+            {
+                let mut client = client_with("test-client", Endpoints::default()).unwrap();
+                client.client_id.clear();
+                client
+            },
+            None,
+        )
+        .unwrap_err();
         match err {
             CoreError::InvalidInput(message) => assert_eq!(message, NOT_CONFIGURED),
             other => panic!("unexpected {other:?}"),
@@ -457,7 +234,11 @@ mod tests {
             authority: "https://login.example.test/common".into(),
             graph: "https://graph.example.test/v1.0".into(),
         };
-        let sign_in = SignIn::start_with("test-client", endpoints).unwrap();
+        let sign_in = SignIn::start(
+            client_with("test-client", endpoints).unwrap(),
+            Some("a@example.com"),
+        )
+        .unwrap();
         let url = url::Url::parse(&sign_in.url()).unwrap();
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("login.example.test"));
@@ -468,19 +249,22 @@ mod tests {
         assert_eq!(q["response_type"], "code");
         assert_eq!(
             q["redirect_uri"],
-            format!("http://localhost:{}", sign_in.loopback.port())
+            format!(
+                "http://localhost:{}",
+                url::Url::parse(&q["redirect_uri"]).unwrap().port().unwrap()
+            )
         );
         assert_eq!(q["scope"], SCOPES.join(" "));
         assert_eq!(q["prompt"], "select_account");
         assert_eq!(q["code_challenge_method"], "S256");
-        assert_eq!(q["code_challenge"], sign_in.pkce.challenge);
+        assert_eq!(q["login_hint"], "a@example.com");
         assert_eq!(q["code_challenge"].len(), 43);
         assert_eq!(q["state"].len(), 43);
-        assert!(!sign_in.url().contains(&sign_in.pkce.verifier));
     }
 
     async fn run_sign_in(server: &MockServer) -> Result<(TokenSet, String)> {
-        let sign_in = SignIn::start_with("test-client", endpoints(server)).unwrap();
+        let sign_in =
+            SignIn::start(client_with("test-client", endpoints(server)).unwrap(), None).unwrap();
         let q = query_map(&sign_in.url());
         let port: u16 = q["redirect_uri"]
             .rsplit(':')
@@ -491,7 +275,9 @@ mod tests {
         let handle = tokio::spawn(sign_in.finish(Duration::from_secs(10)));
         let response = send_get(port, &format!("/?code=auth-code-1&state={}", q["state"])).await;
         assert!(response.contains("You can close this window"), "{response}");
-        handle.await.unwrap()
+        let tokens = handle.await.unwrap()?;
+        let email = account_email(&endpoints(server).graph, &tokens.access_token).await?;
+        Ok((tokens, email))
     }
 
     #[tokio::test]
@@ -578,9 +364,12 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let tokens = refresh_with(&endpoints(&server), "test-client", "rt-old")
-            .await
-            .unwrap();
+        let tokens = refresh(
+            &client_with("test-client", endpoints(&server)).unwrap(),
+            "rt-old",
+        )
+        .await
+        .unwrap();
         assert_eq!(tokens.access_token, "at-new");
         assert_eq!(tokens.refresh_token.as_deref(), Some("rt-new"));
         assert!(tokens.expires_at_ms > crate::auth::now_ms() + 3_500_000);
@@ -598,9 +387,12 @@ mod tests {
                 })))
                 .mount(&server)
                 .await;
-            let err = refresh_with(&endpoints(&server), "test-client", "rt-old")
-                .await
-                .unwrap_err();
+            let err = refresh(
+                &client_with("test-client", endpoints(&server)).unwrap(),
+                "rt-old",
+            )
+            .await
+            .unwrap_err();
             assert!(matches!(err, CoreError::NeedsSignIn { .. }), "{err:?}");
         }
     }
@@ -615,9 +407,12 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let err = refresh_with(&endpoints(&server), "test-client", "rt-secret-value")
-            .await
-            .unwrap_err();
+        let err = refresh(
+            &client_with("test-client", endpoints(&server)).unwrap(),
+            "rt-secret-value",
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, CoreError::Protocol(_)), "{err:?}");
         assert!(err.to_string().contains("invalid_client"));
         assert!(!err.to_string().contains("rt-secret-value"));
