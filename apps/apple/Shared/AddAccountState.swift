@@ -29,6 +29,11 @@ enum AddAccountState: Equatable, Sendable {
         }
     }
 
+    /// `detectAccount` threw (offline, DNS). The Microsoft 365 / Google / IMAP chooser stays reachable.
+    static func detectionFailure(email: String) -> AddAccountState {
+        .unknown(domain: domain(of: email))
+    }
+
     private static func domain(of email: String) -> String {
         guard let at = email.lastIndex(of: "@") else { return email }
         let domain = email[email.index(after: at)...]

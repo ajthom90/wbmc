@@ -27,23 +27,10 @@ struct AddAccount: View {
     @State private var didResume = false
 
     @MainActor
-    init(model: AppModel, resume: AccountInfo? = nil, draft: AddAccountDraft = .init()) {
+    init(model: AppModel, resume: AccountInfo? = nil) {
         self.model = model
         self.resume = resume
         _session = State(initialValue: AddAccountSession(core: model.core, signInStarter: model.signInStarter))
-        _state = State(initialValue: draft.state)
-        _email = State(initialValue: draft.email)
-        _password = State(initialValue: draft.password)
-        _displayName = State(initialValue: draft.displayName)
-        _host = State(initialValue: draft.host)
-        _port = State(initialValue: draft.port)
-        _security = State(initialValue: draft.security)
-        _smtpHost = State(initialValue: draft.smtpHost)
-        _smtpPort = State(initialValue: draft.smtpPort)
-        _smtpSecurity = State(initialValue: draft.smtpSecurity)
-        _username = State(initialValue: draft.username)
-        _detectedUsername = State(initialValue: draft.detectedUsername)
-        _showServerSettings = State(initialValue: draft.showServerSettings)
     }
 
     var body: some View {
@@ -199,7 +186,7 @@ struct AddAccount: View {
         } catch {
             if !Task.isCancelled {
                 errorMessage = friendlyError(error)
-                state = .email
+                state = AddAccountState.detectionFailure(email: address)
             }
         }
     }
@@ -310,20 +297,4 @@ struct AddAccount: View {
         session.cancel()
         dismiss()
     }
-}
-
-struct AddAccountDraft {
-    var state: AddAccountState = .email
-    var email = ""
-    var password = ""
-    var displayName = ""
-    var host = ""
-    var port = "993"
-    var security = "tls"
-    var smtpHost = ""
-    var smtpPort = "465"
-    var smtpSecurity = "tls"
-    var username = ""
-    var detectedUsername: String?
-    var showServerSettings = false
 }

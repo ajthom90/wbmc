@@ -1,8 +1,6 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import AppKit
 import Foundation
-import SwiftUI
 import Synchronization
 import Testing
 import WBMCCore
@@ -331,46 +329,8 @@ struct AppModelTests {
         #expect(AddAccountState.from(unknown, email: "ada@example.com") == .unknown(domain: "example.com"))
     }
 
-    @Test func captureAddAccountStates() async throws {
-        let directory = URL(fileURLWithPath: "/private/tmp/claude-501/-Users-ajthom90-projects-wbmc/72b338b2-2fb2-4e6b-8675-4795623d72f7/scratchpad/m2-t8-shots", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let dataDir = FileManager.default.temporaryDirectory.appendingPathComponent("WBMC-shots-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dataDir) }
-        let core = try WbmcCore(dataDir: dataDir.path, listener: ModelListener())
-        let model = AppModel(core: core)
-        let email = "alice@wbmc.test"
-        let setup = try await core.detectAccount(email: email)
-        let settings = try #require(setup.imap)
-        func draft(_ state: AddAccountState, showSettings: Bool = false) -> AddAccountDraft {
-            AddAccountDraft(
-                state: state, email: email, host: settings.host, port: String(settings.port), security: settings.security,
-                smtpHost: settings.smtpHost, smtpPort: String(settings.smtpPort), smtpSecurity: settings.smtpSecurity,
-                username: settings.username, detectedUsername: settings.username, showServerSettings: showSettings)
-        }
-        let shots: [(String, AddAccountDraft)] = [
-            ("email", AddAccountDraft(state: .email, email: email)),
-            ("detecting", draft(.detecting)),
-            ("oauth-google", draft(.oauth(provider: "google", providerName: "Google"))),
-            ("oauth-microsoft", draft(.oauth(provider: "microsoft", providerName: "Microsoft"))),
-            ("app-password", draft(.appPassword(providerName: "iCloud", url: "https://support.apple.com/en-us/102654", settings: settings))),
-            ("password", draft(.password(providerName: setup.providerName, settings: settings))),
-            ("password-server-settings", draft(.password(providerName: setup.providerName, settings: settings), showSettings: true)),
-            ("unknown", draft(.unknown(domain: "wbmc.test"))),
-            ("manual", draft(.manual(settings: settings))),
-            ("signing-in", draft(.signingIn)),
-            ("adding", draft(.adding)),
-        ]
-        let heights: [String: CGFloat] = [
-            "email": 230, "detecting": 200, "oauth-google": 190, "oauth-microsoft": 190,
-            "app-password": 420, "password": 340, "password-server-settings": 820,
-            "unknown": 190, "manual": 700, "signing-in": 200, "adding": 200,
-        ]
-        for (name, seed) in shots {
-            let data = try renderAddAccountPNG(AddAccount(model: model, draft: seed), height: heights[name] ?? 400)
-            try data.write(to: directory.appendingPathComponent("\(name).png"))
-            #expect(data.count > 1000, "\(name) screenshot was empty")
-        }
+    @Test func detectionFailureFallsBackToUnknown() {
+        #expect(AddAccountState.detectionFailure(email: "ada@example.com") == .unknown(domain: "example.com"))
     }
 
     @Test func accountHueIsStable() {
@@ -388,27 +348,6 @@ struct AppModelTests {
         await model.select(message: nil)
         #expect(model.content == nil)
     }
-}
-
-@MainActor
-private func renderAddAccountPNG(_ view: AddAccount, height: CGFloat) throws -> Data {
-    let host = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)))
-    let size = NSSize(width: 540, height: height)
-    host.frame = NSRect(origin: .zero, size: size)
-    let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
-    window.contentView = host
-    window.setFrameOrigin(NSPoint(x: -20000, y: -20000))
-    host.layoutSubtreeIfNeeded()
-    window.displayIfNeeded()
-    host.displayIfNeeded()
-    guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
-        throw CocoaError(.fileWriteUnknown)
-    }
-    host.cacheDisplay(in: host.bounds, to: rep)
-    guard let png = rep.representation(using: .png, properties: [:]) else {
-        throw CocoaError(.fileWriteUnknown)
-    }
-    return png
 }
 
 private extension AppModelTests {
