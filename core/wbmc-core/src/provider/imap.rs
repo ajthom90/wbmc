@@ -564,9 +564,9 @@ fn page_plan(
             lowest_uid,
         }) if previous == uid_validity => (Some((lowest_uid, highest_uid)), false),
         Some(FolderSyncState::Imap { .. }) => (None, true),
-        Some(FolderSyncState::Graph { .. }) => {
+        Some(FolderSyncState::Graph { .. } | FolderSyncState::Gmail { .. }) => {
             return Err(CoreError::InvalidInput(
-                "IMAP sync received Graph folder state".into(),
+                "IMAP sync requires IMAP folder state".into(),
             ));
         }
     };

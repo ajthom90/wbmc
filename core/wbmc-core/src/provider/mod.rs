@@ -3,9 +3,11 @@
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake;
 
+pub mod gmail;
 pub mod graph;
 mod imap;
 
+pub use gmail::GmailProvider;
 pub use graph::GraphProvider;
 pub use imap::{ImapConfig, ImapProvider, Security};
 
@@ -43,7 +45,7 @@ pub struct RemoteMessage {
 
 /// Cursor for the next [`MailProvider::sync_folder`] call.
 ///
-/// Stored as JSON in `folders.sync_state`. `kind` is `Imap` or `Graph`.
+/// Stored as JSON in `folders.sync_state`. `kind` is `Imap`, `Graph`, or `Gmail`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum FolderSyncState {
@@ -51,6 +53,11 @@ pub enum FolderSyncState {
         uid_validity: u32,
         highest_uid: u32,
         lowest_uid: u32,
+    },
+    Gmail {
+        history_id: Option<String>,
+        page_token: Option<String>,
+        backfilled: bool,
     },
     Graph {
         delta_link: Option<String>,
@@ -70,7 +77,7 @@ pub struct FlagUpdate {
 ///
 /// `reset` means the local cache for the folder must be cleared before applying
 /// `upserts`. `more` means another page remains. `deleted_remote_ids` is filled
-/// by providers that name removals themselves (Graph). IMAP leaves it empty and
+/// by providers that name removals themselves (Graph and Gmail). IMAP leaves it empty and
 /// instead sets `server_remote_ids` to every UID still on the server, on the
 /// final page of an incremental pass. `flag_updates` is filled on that same page.
 #[derive(Debug, Clone, PartialEq, Eq)]

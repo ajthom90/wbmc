@@ -3,6 +3,7 @@
 mod bodies;
 mod migrations;
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -164,6 +165,45 @@ impl Store {
         let rows = stmt.query_map([account_id.as_str()], map_folder)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Removes folders absent from the server and returns their message ids for body cleanup.
+    pub fn delete_folders_not_in(
+        &self,
+        account: &AccountId,
+        remote_ids: &[String],
+    ) -> Result<Vec<MessageId>> {
+        let retained: HashSet<&str> = remote_ids.iter().map(String::as_str).collect();
+        self.in_transaction(|tx| {
+            let mut stmt = tx.prepare("SELECT id, remote_id FROM folders WHERE account_id = ?1")?;
+            let rows = stmt.query_map([account.as_str()], |row| {
+                Ok((
+                    FolderId::from(row.get::<_, String>(0)?),
+                    row.get::<_, String>(1)?,
+                ))
+            })?;
+            let mut doomed = Vec::new();
+            for row in rows {
+                let (id, remote_id) = row?;
+                if !retained.contains(remote_id.as_str()) {
+                    doomed.push(id);
+                }
+            }
+            // Detach children before deletion: the schema cascades parent deletes.
+            // A child still present on the server must survive a removed parent.
+            for id in &doomed {
+                tx.execute(
+                    "UPDATE folders SET parent_id = NULL WHERE parent_id = ?1",
+                    [id.as_str()],
+                )?;
+            }
+            let mut removed = Vec::new();
+            for id in &doomed {
+                removed.extend(clear_folder_tx(tx, id)?);
+                tx.execute("DELETE FROM folders WHERE id = ?1", [id.as_str()])?;
+            }
+            Ok(removed)
+        })
     }
 
     pub fn folder_sync_state(&self, folder_id: &FolderId) -> Result<Option<String>> {
@@ -1042,6 +1082,102 @@ mod tests {
         let missing = account();
         let error = store.update_account(&missing).unwrap_err();
         assert!(matches!(error, crate::CoreError::NotFound(_)), "{error}");
+    }
+
+    #[test]
+    fn delete_folders_not_in_returns_messages_and_is_account_scoped() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        let mut other = account.clone();
+        other.id = AccountId::new();
+        store.insert_account(&account).unwrap();
+        store.insert_account(&other).unwrap();
+        let kept = store.upsert_folder(&folder(&account.id, "keep")).unwrap();
+        let gone = store.upsert_folder(&folder(&account.id, "gone")).unwrap();
+        let other_folder = store.upsert_folder(&folder(&other.id, "gone")).unwrap();
+        let kept_msg = message(&account.id, &kept.id, "k", 1, false);
+        let gone_msg = message(&account.id, &gone.id, "g", 1, false);
+        let other_msg = message(&other.id, &other_folder.id, "o", 1, false);
+        store
+            .upsert_messages(&[kept_msg.clone(), gone_msg.clone(), other_msg.clone()])
+            .unwrap();
+        let removed = store
+            .delete_folders_not_in(&account.id, &["keep".into()])
+            .unwrap();
+        assert_eq!(removed, vec![gone_msg.id.clone()]);
+        assert!(store.message(&gone_msg.id).unwrap().is_none());
+        assert!(store.message(&kept_msg.id).unwrap().is_some());
+        assert!(store.message(&other_msg.id).unwrap().is_some());
+        assert_eq!(store.folders(&account.id).unwrap(), vec![kept]);
+        assert_eq!(store.folders(&other.id).unwrap(), vec![other_folder]);
+        assert!(
+            store
+                .delete_folders_not_in(&account.id, &["keep".into()])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.delete_folders_not_in(&account.id, &[]).unwrap(),
+            vec![kept_msg.id]
+        );
+        assert!(store.folders(&account.id).unwrap().is_empty());
+        assert!(store.message(&other_msg.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_folders_not_in_preserves_retained_child_and_rolls_back() {
+        let (_dir, store) = temp_store();
+        let account = account();
+        store.insert_account(&account).unwrap();
+        let parent = store.upsert_folder(&folder(&account.id, "parent")).unwrap();
+        let mut child = folder(&account.id, "child");
+        child.parent_id = Some(parent.id.clone());
+        let child = store.upsert_folder(&child).unwrap();
+        let gone = message(&account.id, &parent.id, "gone", 1, false);
+        let kept = message(&account.id, &child.id, "kept", 1, false);
+        store
+            .upsert_messages(&[gone.clone(), kept.clone()])
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_folder_delete BEFORE DELETE ON folders
+             BEGIN SELECT RAISE(ABORT, 'injected folder failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .delete_folders_not_in(&account.id, &["child".into()])
+                .is_err()
+        );
+        assert!(store.message(&gone.id).unwrap().is_some());
+        assert_eq!(
+            store
+                .folders(&account.id)
+                .unwrap()
+                .iter()
+                .find(|f| f.id == child.id)
+                .unwrap()
+                .parent_id,
+            Some(parent.id)
+        );
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_folder_delete")
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_folders_not_in(&account.id, &["child".into()])
+                .unwrap(),
+            vec![gone.id]
+        );
+        let folders = store.folders(&account.id).unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].id, child.id);
+        assert_eq!(folders[0].parent_id, None);
+        assert!(store.message(&kept.id).unwrap().is_some());
     }
 
     #[test]

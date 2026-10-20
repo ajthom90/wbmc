@@ -332,7 +332,7 @@ impl MailProvider for GraphProvider {
             Some(FolderSyncState::Graph { .. }) | None => {
                 (None, self.initial_delta_url(&folder.remote_id)?, false)
             }
-            Some(FolderSyncState::Imap { .. }) => {
+            Some(FolderSyncState::Imap { .. } | FolderSyncState::Gmail { .. }) => {
                 return Err(CoreError::InvalidInput("graph sync state required".into()));
             }
         };
