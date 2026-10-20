@@ -102,14 +102,21 @@ impl SyncEngine {
     async fn sync(&self, account: &Account, provider: &dyn MailProvider) -> Result<()> {
         let remote_folders = call_provider(provider.list_folders()).await?;
         let mut folders = self.upsert_folders(account, remote_folders)?;
-        let remote_ids: Vec<String> = folders
+        if folders
             .iter()
-            .map(|(_, remote)| remote.remote_id.clone())
-            .collect();
-        self.remove_bodies(
-            account,
-            self.store.delete_folders_not_in(&account.id, &remote_ids)?,
-        )?;
+            .any(|(folder, _)| folder.role == FolderRole::Inbox)
+        {
+            let remote_ids: Vec<String> = folders
+                .iter()
+                .map(|(_, remote)| remote.remote_id.clone())
+                .collect();
+            self.remove_bodies(
+                account,
+                self.store.delete_folders_not_in(&account.id, &remote_ids)?,
+            )?;
+        } else {
+            tracing::warn!("remote folder list has no Inbox; keeping local folders");
+        }
         self.events.emit(CoreEvent::FoldersChanged {
             account_id: account.id.clone(),
         });
@@ -519,8 +526,33 @@ mod tests {
         );
         let empty = FakeProvider::new(vec![], HashMap::new());
         h.engine.sync_account(&h.account, &empty).await.unwrap();
-        assert!(h.store.folders(&h.account.id).unwrap().is_empty());
-        assert!(h.bodies.get(&h.account.id, &kept).unwrap().is_none());
+        assert_eq!(h.store.folders(&h.account.id).unwrap(), folders);
+        assert!(h.store.message(&kept).unwrap().is_some());
+        assert!(h.bodies.get(&h.account.id, &kept).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn folder_list_without_inbox_keeps_local_data_and_continues_sync() {
+        let h = Harness::new();
+        let initial = provider(1, FolderRole::Inbox);
+        h.engine.sync_account(&h.account, &initial).await.unwrap();
+        let inbox = h.folder("inbox");
+        let kept = h.store.messages(&inbox.id, 0, 10).unwrap()[0].id.clone();
+        let partial = FakeProvider::new(
+            vec![remote_folder("label", FolderRole::Other)],
+            HashMap::from([("label".into(), vec![remote_message(2)])]),
+        );
+        h.engine.sync_account(&h.account, &partial).await.unwrap();
+        assert_eq!(h.store.folders(&h.account.id).unwrap().len(), 2);
+        assert!(h.store.message(&kept).unwrap().is_some());
+        assert!(h.bodies.get(&h.account.id, &kept).unwrap().is_some());
+        assert_eq!(
+            h.store
+                .messages(&h.folder("label").id, 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

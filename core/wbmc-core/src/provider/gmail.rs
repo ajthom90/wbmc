@@ -149,16 +149,7 @@ impl GmailProvider {
         if status.as_u16() == 404 {
             return Ok(None);
         }
-        if !status.is_success() {
-            // Never include server-supplied messages or request URLs in errors.
-            return Err(CoreError::Protocol(format!(
-                "gmail HTTP {}",
-                status.as_u16()
-            )));
-        }
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|_| CoreError::Protocol("gmail invalid JSON".into()))
+        decode_json(status, &bytes).map(Some)
     }
 
     async fn json<T: DeserializeOwned>(&self, url: url::Url) -> Result<T> {
@@ -215,10 +206,18 @@ impl GmailProvider {
         url.query_pairs_mut()
             .append_pair("labelIds", &folder.remote_id)
             .append_pair("maxResults", &page_size.min(100).to_string());
+        let has_page_token = page_token.is_some();
         if let Some(token) = page_token {
             url.query_pairs_mut().append_pair("pageToken", &token);
         }
-        let page: MessagePage = self.json(url).await?;
+        let (status, bytes) = self.get(url).await?;
+        if has_page_token && matches!(status.as_u16(), 400 | 404) {
+            return Ok(reset_delta());
+        }
+        if status.as_u16() == 404 {
+            return Err(CoreError::NotFound("gmail resource".into()));
+        }
+        let page: MessagePage = decode_json(status, &bytes)?;
         let mut delta = empty_delta(
             Some(history_id),
             page.next_page_token.clone(),
@@ -253,10 +252,7 @@ impl GmailProvider {
                 url.query_pairs_mut().append_pair("pageToken", &token);
             }
             let Some(page): Option<HistoryPage> = self.optional_json(url).await? else {
-                let mut delta = empty_delta(None, None, false);
-                delta.reset = true;
-                delta.more = true;
-                return Ok(delta);
+                return Ok(reset_delta());
             };
             for history in page.history {
                 for change in history
@@ -372,7 +368,6 @@ impl MailProvider for GmailProvider {
 
 #[derive(Deserialize)]
 struct LabelPage {
-    #[serde(default)]
     labels: Vec<Label>,
 }
 
@@ -491,6 +486,24 @@ fn map_labels(labels: Vec<Label>) -> Vec<RemoteFolder> {
             })
         })
         .collect()
+}
+
+fn decode_json<T: DeserializeOwned>(status: reqwest::StatusCode, bytes: &[u8]) -> Result<T> {
+    if !status.is_success() {
+        // Never include server-supplied messages or request URLs in errors.
+        return Err(CoreError::Protocol(format!(
+            "gmail HTTP {}",
+            status.as_u16()
+        )));
+    }
+    serde_json::from_slice(bytes).map_err(|_| CoreError::Protocol("gmail invalid JSON".into()))
+}
+
+fn reset_delta() -> FolderDelta {
+    let mut delta = empty_delta(None, None, false);
+    delta.reset = true;
+    delta.more = true;
+    delta
 }
 
 fn empty_delta(
@@ -690,8 +703,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        GmailMessage, GmailProvider, Label, SleepFn, decode_entities, is_rate_limit, map_labels,
-        map_message, retry_after,
+        GmailMessage, GmailProvider, Label, LabelPage, SleepFn, decode_entities, decode_json,
+        is_rate_limit, map_labels, map_message, retry_after,
     };
     use crate::CoreError;
     use crate::auth::{TokenManager, google};
@@ -963,6 +976,7 @@ mod tests {
             .await
             .unwrap();
         assert!(delta.reset);
+        assert!(delta.more);
         assert!(delta.upserts.is_empty());
         assert_eq!(
             delta.new_state,
@@ -972,6 +986,81 @@ mod tests {
                 backfilled: false
             }
         );
+    }
+
+    #[test]
+    fn labels_response_requires_labels_field() {
+        for body in [b"{}".as_slice(), br#"{"labels":null}"#, br#"{"labels":{}}"#] {
+            assert!(matches!(
+                decode_json::<LabelPage>(reqwest::StatusCode::OK, body),
+                Err(CoreError::Protocol(_))
+            ));
+        }
+        assert!(
+            decode_json::<LabelPage>(reqwest::StatusCode::OK, br#"{"labels":[]}"#)
+                .unwrap()
+                .labels
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn labels_missing_field_is_protocol_error() {
+        let env = env().await;
+        get(&env, "labels", json!({})).await;
+        assert!(matches!(
+            env.provider.list_folders().await,
+            Err(CoreError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_page_token_resets() {
+        for status in [400, 404] {
+            let env = env().await;
+            Mock::given(method("GET"))
+                .and(path(format!("{ROOT}/messages")))
+                .and(query_param("pageToken", "stale"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&env.server)
+                .await;
+            let delta = env
+                .provider
+                .sync_folder(
+                    &inbox(),
+                    Some(FolderSyncState::Gmail {
+                        history_id: Some("100".into()),
+                        page_token: Some("stale".into()),
+                        backfilled: false,
+                    }),
+                    50,
+                )
+                .await
+                .unwrap();
+            assert!(delta.reset);
+            assert!(delta.more);
+            assert!(delta.upserts.is_empty());
+            assert_eq!(
+                delta.new_state,
+                FolderSyncState::Gmail {
+                    history_id: None,
+                    page_token: None,
+                    backfilled: false,
+                }
+            );
+            // The cleared state starts a fresh backfill on the next call.
+            get(&env, "profile", json!({"historyId":"200"})).await;
+            get(&env, "messages", json!({"messages":[]})).await;
+            let restarted = env
+                .provider
+                .sync_folder(&inbox(), Some(delta.new_state), 50)
+                .await
+                .unwrap();
+            assert!(!restarted.reset);
+            assert!(!restarted.more);
+            assert_eq!(restarted.new_state, state("200"));
+        }
     }
 
     #[tokio::test]
