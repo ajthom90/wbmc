@@ -175,8 +175,9 @@ pub struct AccountSetupInfo {
     pub app_password_url: Option<String>,
 }
 
-/// IMAP and SMTP settings from detection. `username` is the first alternative,
-/// with `email` / `local` expanded against the typed address.
+/// IMAP and SMTP settings from detection. `username` is the first alternative.
+/// Core has already expanded detection tokens, so these are real login names
+/// (`email` and `local` are not rewritten here).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ImapSettings {
     pub host: String,
@@ -282,6 +283,9 @@ pub trait CoreListener: Send + Sync {
 struct EventBridge {
     listener: Arc<dyn CoreListener>,
     statuses: Mutex<HashMap<AccountId, &'static str>>,
+    /// Bumped on every status write so a late idle notification can be discarded
+    /// once a newer sync has published its own status.
+    status_epochs: Mutex<HashMap<AccountId, u64>>,
     /// Accounts removed in this process. Late events from in-flight work are dropped.
     removed: Mutex<HashSet<AccountId>>,
     /// Incremented by a successful sign-in. A sync captures the value it started with.
@@ -301,12 +305,45 @@ impl EventBridge {
         self.statuses().get(account_id).copied().unwrap_or("idle")
     }
 
-    fn set_status(&self, account_id: &AccountId, status: &'static str) {
+    fn set_status(&self, account_id: &AccountId, status: &'static str) -> u64 {
         self.statuses().insert(account_id.clone(), status);
+        let mut epochs = self.status_epochs();
+        let next = epochs
+            .get(account_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        epochs.insert(account_id.clone(), next);
+        next
+    }
+
+    fn status_epochs(&self) -> MutexGuard<'_, HashMap<AccountId, u64>> {
+        self.status_epochs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn status_epoch(&self, account_id: &AccountId) -> u64 {
+        self.status_epochs().get(account_id).copied().unwrap_or(0)
+    }
+
+    /// Tells the listener the account is idle, unless a newer status write won the race.
+    fn notify_idle(&self, account_id: &AccountId, epoch: u64) {
+        if self.status_epoch(account_id) != epoch {
+            return;
+        }
+        self.listener.on_event(
+            CoreEvent::SyncStatus {
+                account_id: account_id.clone(),
+                status: SyncStatus::Idle,
+            }
+            .into(),
+        );
     }
 
     fn forget(&self, account_id: &AccountId) {
         self.statuses().remove(account_id);
+        self.status_epochs().remove(account_id);
         self.generations().remove(account_id);
         self.sync_generations().remove(account_id);
     }
@@ -328,7 +365,7 @@ impl EventBridge {
     }
 
     /// A successful sign-in advances the generation so an older sync cannot
-    /// put the account back into `needs_sign_in` or `error`.
+    /// overwrite the account status, including progress events.
     fn bump_generation(&self, account_id: &AccountId) {
         let mut generations = self.generations();
         let next = generations
@@ -371,11 +408,10 @@ impl EventSink for EventBridge {
             {
                 return;
             }
-            // A sync that started before sign-in must not undo the idle state.
-            CoreEvent::SyncStatus { account_id, status }
-                if self.sync_is_stale(account_id)
-                    && matches!(status, SyncStatus::NeedsSignIn | SyncStatus::Error { .. }) =>
-            {
+            // A sync that started before sign-in must not change status at all.
+            // Progress (`Syncing`) used to stick the account on "syncing" after
+            // its later failure was dropped.
+            CoreEvent::SyncStatus { account_id, .. } if self.sync_is_stale(account_id) => {
                 return;
             }
             CoreEvent::SyncStatus { account_id, status } => {
@@ -400,6 +436,9 @@ struct Inner {
     events: Arc<EventBridge>,
     /// Running syncs, with the task's abort handle once it is spawned.
     syncing: Mutex<HashMap<AccountId, Option<tokio::task::AbortHandle>>>,
+    /// Sign-in has bumped the generation and has not finished storing tokens.
+    /// A stale sync that ends in this window must not start another sync yet.
+    restart_after_store: Mutex<HashSet<AccountId>>,
     runtime: tokio::runtime::Handle,
     /// Clients used for interactive sign-in. Missing entries fall through to
     /// `microsoft::client` / `google::client` so a missing configuration still errors.
@@ -418,12 +457,7 @@ struct SyncGuard {
 
 impl Drop for SyncGuard {
     fn drop(&mut self) {
-        // Runs on completion and on abort. A sync that outlived `remove_account` may have
-        // written bodies or a rotated refresh token, so purge again before releasing.
-        if self.inner.events.is_removed(&self.account_id) {
-            self.inner.purge(&self.account_id);
-        }
-        self.inner.syncing().remove(&self.account_id);
+        self.inner.finish_sync(self.account_id.clone());
     }
 }
 
@@ -444,6 +478,42 @@ impl Inner {
         self.syncing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn restart_after_store(&self) -> MutexGuard<'_, HashSet<AccountId>> {
+        self.restart_after_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Releases the sync slot. A sync from an older sign-in publishes idle and,
+    /// once the new tokens are stored, starts a sync that uses them.
+    ///
+    /// Aborting that sync from `finish_oauth` would cancel it before the progress
+    /// event it still emits, and `spawn_sync` cannot take the slot until this drop.
+    fn finish_sync(self: &Arc<Self>, account_id: AccountId) {
+        // Runs on completion and on abort. A sync that outlived `remove_account` may have
+        // written bodies or a rotated refresh token, so purge again before releasing.
+        if self.events.is_removed(&account_id) {
+            self.purge(&account_id);
+        }
+        let (spawn, idle_epoch) = {
+            let mut syncing = self.syncing();
+            syncing.remove(&account_id);
+            if self.events.is_removed(&account_id) || !self.events.sync_is_stale(&account_id) {
+                (false, None)
+            } else {
+                let epoch = self.events.set_status(&account_id, "idle");
+                let spawn = !self.restart_after_store().contains(&account_id);
+                (spawn, Some(epoch))
+            }
+        };
+        if let Some(epoch) = idle_epoch {
+            self.events.notify_idle(&account_id, epoch);
+        }
+        if spawn {
+            self.spawn_sync(&account_id);
+        }
     }
 
     /// Registers a sync for the account, or returns `None` when one is already running.
@@ -533,7 +603,10 @@ impl Inner {
         .await;
         if let Err(error) = &result {
             // Failures before the engine starts would otherwise leave the status "syncing".
-            if self.events.status(&guard.account_id) == "syncing" {
+            // A stale sync's outcome is dropped; `finish_sync` publishes idle instead.
+            if self.events.status(&guard.account_id) == "syncing"
+                && !self.events.sync_is_stale(&guard.account_id)
+            {
                 let status = match error {
                     FfiError::NeedsSignIn { .. } => SyncStatus::NeedsSignIn,
                     other => SyncStatus::Error {
@@ -684,7 +757,7 @@ impl Inner {
                     username_alternatives,
                     ..
                 } => {
-                    let candidates = username_candidates(&input.email, &username_alternatives);
+                    let candidates = username_candidates(&username_alternatives);
                     if candidates.is_empty() {
                         return Err(invalid("username is required"));
                     }
@@ -697,7 +770,8 @@ impl Inner {
         };
         // Verify the login before anything is saved. A rejected login is bad input here,
         // not an existing account that needs to sign in again. An empty username tries
-        // each detected alternative (iCloud's local part, then the full address).
+        // each detected alternative in order. Core has already expanded those into
+        // real login names.
         let mut config = None;
         let mut rejected = false;
         for username in candidates {
@@ -795,7 +869,7 @@ impl Inner {
 
     async fn detect_account(self: Arc<Self>, email: String) -> FfiResult<AccountSetupInfo> {
         let setup = self.detect_setup(&email).await?;
-        Ok(setup_info(&email, setup))
+        Ok(setup_info(setup))
     }
 
     async fn finish_oauth(
@@ -815,16 +889,49 @@ impl Inner {
         };
         let store = self.store.clone();
         let manager = self.tokens.clone();
+        let events = Arc::clone(&self.events);
+        let signing_in = Arc::clone(&self);
         let account = blocking(move || {
-            save_oauth_account(&store, kind, email, |id| manager.store(id, &tokens))
+            save_oauth_account(&store, kind, email, |id| {
+                // Bump before the write so an in-flight sync is stale before it
+                // can observe the new tokens. Hold restarts until `settle_after_sign_in`.
+                signing_in.restart_after_store().insert(id.clone());
+                events.bump_generation(id);
+                match manager.store(id, &tokens) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        signing_in.restart_after_store().remove(id);
+                        Err(error)
+                    }
+                }
+            })
         })
         .await?;
-        // Bump first so a sync that is still failing cannot overwrite idle.
-        self.events.bump_generation(&account.id);
-        self.events.set_status(&account.id, "idle");
-        self.events.emit(CoreEvent::AccountsChanged);
-        self.spawn_sync(&account.id);
+        self.settle_after_sign_in(&account.id);
         Ok(self.account_info(&account))
+    }
+
+    /// After tokens are stored: idle unless a newer sync already owns the status,
+    /// and start a sync when the previous one has released the slot.
+    fn settle_after_sign_in(self: &Arc<Self>, account_id: &AccountId) {
+        let (spawn, idle_epoch) = {
+            let syncing = self.syncing();
+            self.restart_after_store().remove(account_id);
+            if syncing.contains_key(account_id) && !self.events.sync_is_stale(account_id) {
+                (false, None)
+            } else {
+                let epoch = self.events.set_status(account_id, "idle");
+                let spawn = !syncing.contains_key(account_id);
+                (spawn, Some(epoch))
+            }
+        };
+        if let Some(epoch) = idle_epoch {
+            self.events.notify_idle(account_id, epoch);
+        }
+        self.events.emit(CoreEvent::AccountsChanged);
+        if spawn {
+            self.spawn_sync(account_id);
+        }
     }
 
     async fn remove_account(self: Arc<Self>, account_id: AccountId) -> FfiResult<()> {
@@ -991,33 +1098,20 @@ fn security_name(security: Security) -> String {
     .to_string()
 }
 
-/// `email` and `local` are detection tokens, not mailbox names.
-fn expand_username(email: &str, alternative: &str) -> String {
-    let email = email.trim();
-    match alternative {
-        "email" => email.to_string(),
-        "local" => email
-            .split_once('@')
-            .map(|(local, _)| local.trim().to_string())
-            .filter(|local| !local.is_empty())
-            .unwrap_or_default(),
-        other => other.trim().to_string(),
-    }
-}
-
-fn username_candidates(email: &str, alternatives: &[String]) -> Vec<String> {
+/// Real login names from core: trim, drop empties, dedupe, keep order.
+fn username_candidates(alternatives: &[String]) -> Vec<String> {
     let mut candidates = Vec::new();
     for alternative in alternatives {
-        let username = expand_username(email, alternative);
-        if username.is_empty() || candidates.iter().any(|existing| existing == &username) {
+        let username = alternative.trim();
+        if username.is_empty() || candidates.iter().any(|existing| existing == username) {
             continue;
         }
-        candidates.push(username);
+        candidates.push(username.to_string());
     }
     candidates
 }
 
-fn setup_info(email: &str, setup: AccountSetup) -> AccountSetupInfo {
+fn setup_info(setup: AccountSetup) -> AccountSetupInfo {
     match setup {
         AccountSetup::Microsoft => AccountSetupInfo {
             kind: "microsoft".into(),
@@ -1043,7 +1137,7 @@ fn setup_info(email: &str, setup: AccountSetup) -> AccountSetupInfo {
             username_alternatives,
             app_password_url,
         } => {
-            let username = username_candidates(email, &username_alternatives)
+            let username = username_candidates(&username_alternatives)
                 .into_iter()
                 .next()
                 .unwrap_or(config.username);
@@ -1155,6 +1249,7 @@ impl WbmcCore {
         let events = Arc::new(EventBridge {
             listener,
             statuses: Mutex::new(HashMap::new()),
+            status_epochs: Mutex::new(HashMap::new()),
             removed: Mutex::new(HashSet::new()),
             generations: Mutex::new(HashMap::new()),
             sync_generations: Mutex::new(HashMap::new()),
@@ -1169,6 +1264,7 @@ impl WbmcCore {
             tokens,
             events,
             syncing: Mutex::new(HashMap::new()),
+            restart_after_store: Mutex::new(HashSet::new()),
             runtime: runtime.handle().clone(),
             oauth_clients,
             graph_base,

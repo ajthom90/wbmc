@@ -613,7 +613,7 @@ async fn detect_account_maps_profile() {
     assert_eq!(imap.host, "localhost");
     assert_eq!(imap.port, 3143);
     assert_eq!(imap.security, "none");
-    // "email" expands to the typed address so the prefilled login is usable.
+    // Core already expanded the profile token to the typed address.
     assert_eq!(imap.username, "x@wbmc.test");
     assert_eq!(imap.smtp_host, "localhost");
     assert_eq!(imap.smtp_port, 3025);
@@ -648,10 +648,21 @@ async fn detect_account_uses_injected_env() {
 }
 
 #[test]
-fn username_candidates_expand_local_then_email() {
+fn username_candidates_pass_through_literal_logins() {
+    // "email" and "local" are real mailbox names here, not detection tokens.
     assert_eq!(
-        username_candidates("Ada@Example.com", &["local".into(), "email".into()]),
-        vec!["Ada".to_string(), "Ada@Example.com".to_string()]
+        username_candidates(&["local".into(), "email".into()]),
+        vec!["local".to_string(), "email".to_string()]
+    );
+    assert_eq!(
+        username_candidates(&[
+            " email ".into(),
+            "email".into(),
+            String::new(),
+            "Ada".into(),
+            "Ada".into(),
+        ]),
+        vec!["email".to_string(), "Ada".to_string()]
     );
 }
 
@@ -949,56 +960,154 @@ async fn empty_username_tries_detected_alternative() {
 
 #[tokio::test]
 async fn resign_in_during_failing_sync_ends_idle() {
-    use wiremock::matchers::{method, path};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, ResponseTemplate};
 
     let (h, server) = oauth_harness().await;
+    // First code exchange is the original sign-in. Everything after that, including
+    // refresh, succeeds with the new access token.
+    let token_calls = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(token_json("test-access", "test-refresh")),
-        )
-        .with_priority(1)
-        .up_to_n_times(2)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/token"))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": "invalid_grant"})),
-        )
-        .with_priority(10)
+        .respond_with(move |_: &wiremock::Request| {
+            let call = token_calls.fetch_add(1, Ordering::SeqCst);
+            let (access, refresh) = if call == 0 {
+                ("old-access", "old-refresh")
+            } else {
+                ("new-access", "new-refresh")
+            };
+            ResponseTemplate::new(200).set_body_json(token_json(access, refresh))
+        })
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/gmail/v1/users/me/profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"emailAddress": "real@gmail.com", "historyId": "100"}),
+        ))
+        .mount(&server)
+        .await;
+    let inbox = serde_json::json!({"labels":[
+        {"id":"INBOX","name":"INBOX","type":"system"}
+    ]});
+    // Held open across re-sign-in so the stale sync emits Syncing{done} afterwards.
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/labels"))
+        .and(header("authorization", "Bearer old-access"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"emailAddress": "real@gmail.com"})),
+                .set_delay(Duration::from_secs(5))
+                .set_body_json(inbox.clone()),
         )
+        .with_priority(1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/gmail/v1/users/me/labels"))
-        .respond_with(ResponseTemplate::new(401).set_delay(Duration::from_secs(5)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(inbox))
+        .with_priority(5)
+        .mount(&server)
+        .await;
+    let message_lists = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/messages"))
+        .respond_with(move |_: &wiremock::Request| {
+            let call = message_lists.fetch_add(1, Ordering::SeqCst);
+            let body = if call == 0 {
+                serde_json::json!({"messages":[{"id":"m1"}]})
+            } else {
+                serde_json::json!({"messages":[]})
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/messages/m1"))
+        .and(query_param("format", "metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "m1",
+            "internalDate": "1700000000123",
+            "labelIds": ["INBOX"],
+            "snippet": "hi",
+            "payload": {"headers": [{"name": "Subject", "value": "Hi"}]}
+        })))
+        .mount(&server)
+        .await;
+    // After the progress event, the stale sync fails. The fresh sync lists no messages.
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/messages/m1"))
+        .and(query_param("format", "raw"))
+        .respond_with(ResponseTemplate::new(401))
         .mount(&server)
         .await;
 
     let account = finish_google(&h.core, "typed@gmail.com").await;
     let started = Instant::now();
-    while !h.core.is_syncing(&account.id) {
+    loop {
+        let requests = server.received_requests().await.expect("request log");
+        let labels_in_flight = requests.iter().any(|request| {
+            request.url.path() == "/gmail/v1/users/me/labels"
+                && request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Bearer old-access")
+        });
+        if labels_in_flight {
+            break;
+        }
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "sync did not start"
+            "stale sync did not request labels"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let again = finish_google(&h.core, "typed@gmail.com").await;
     assert_eq!(again.id, account.id);
-    wait_for_sync(&h.core, &account.id).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        h.core.is_syncing(&account.id),
+        "stale sync ended before re-sign-in returned"
+    );
+    let during_sign_in = server.received_requests().await.expect("request log");
+    assert!(
+        !during_sign_in
+            .iter()
+            .any(|request| request.url.path() == "/gmail/v1/users/me/messages"),
+        "stale sync listed messages before re-sign-in returned"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = h
+            .core
+            .accounts()
+            .first()
+            .map(|account| account.status.clone());
+        let syncing = h.core.is_syncing(&account.id);
+        let requests = server.received_requests().await.expect("request log");
+        let saw_new_token = requests.iter().any(|request| {
+            request.url.path() == "/gmail/v1/users/me/labels"
+                && request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Bearer new-access")
+        });
+        if status.as_deref() == Some("idle") && !syncing && saw_new_token {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status={status:?} syncing={syncing} saw_new_token={saw_new_token} events={:?}",
+            h.events.events()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(h.core.accounts().len(), 1);
     assert_eq!(h.core.accounts()[0].status, "idle");
+    assert!(!h.core.is_syncing(&account.id));
     assert!(
         !h.events.events().iter().any(|event| matches!(
             event,
