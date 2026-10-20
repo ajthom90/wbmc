@@ -2974,13 +2974,16 @@ dependencies = [
  "futures",
  "libc",
  "mail-parser",
+ "reqwest",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "uniffi",
+ "url",
  "wbmc-core",
+ "wiremock",
 ]
 
 [[package]]

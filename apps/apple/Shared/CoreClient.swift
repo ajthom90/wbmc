@@ -5,20 +5,23 @@ import WBMCCore
 
 typealias CoreClient = WbmcCoreProtocol
 
-protocol MicrosoftSignInFlow: AnyObject, Sendable {
+protocol OAuthSignInFlow: AnyObject, Sendable {
     func url() -> String
     func finish() async throws -> AccountInfo
+    func cancel()
 }
 
-extension MicrosoftSignIn: MicrosoftSignInFlow {}
+extension OAuthSignIn: OAuthSignInFlow {}
 
 protocol SignInStarter: Sendable {
-    func start() throws -> any MicrosoftSignInFlow
+    func start() throws -> any OAuthSignInFlow
 }
 
 struct CoreSignInStarter: SignInStarter {
     let core: any CoreClient
-    func start() throws -> any MicrosoftSignInFlow { try core.beginMicrosoftSignIn() }
+    func start() throws -> any OAuthSignInFlow {
+        try core.beginSignIn(provider: "microsoft", loginHint: nil)
+    }
 }
 
 func friendlyError(_ error: any Error) -> String {

@@ -44,7 +44,7 @@ final class FakeCore: WbmcCoreProtocol, Sendable {
             return value.rowCount
         }
         return (Int(offset)..<max(Int(offset), min(count, Int(offset + limit)))).map {
-            MessageRow(id: "m\($0)", subject: "Subject \($0)", fromName: "Sender", fromEmail: "sender@wbmc.test",
+            MessageRow(id: "m\($0)", accountId: "a", subject: "Subject \($0)", fromName: "Sender", fromEmail: "sender@wbmc.test",
                        dateMs: 0, snippet: "Preview", isRead: false, isFlagged: false, hasAttachments: false)
         }
     }
@@ -54,7 +54,13 @@ final class FakeCore: WbmcCoreProtocol, Sendable {
     static let content = MessageContent(subject: "Body", fromName: "Sender", fromEmail: "sender@wbmc.test",
                                        to: ["reader@wbmc.test"], cc: [], dateMs: 0, html: nil, text: "Hello", attachments: [])
     func addImapAccount(input: ImapAccountInput) async throws -> AccountInfo { accounts()[0] }
-    func beginMicrosoftSignIn() throws -> MicrosoftSignIn { throw FfiError.InvalidInput(message: "Use FakeSignInStarter") }
+    func beginSignIn(provider: String, loginHint: String?) throws -> OAuthSignIn {
+        throw FfiError.InvalidInput(message: "Use FakeSignInStarter")
+    }
+    func detectAccount(email: String) async throws -> AccountSetupInfo {
+        throw FfiError.InvalidInput(message: "not used")
+    }
+    func unifiedMessages(offset: UInt32, limit: UInt32) -> [MessageRow] { [] }
     func debugRefreshToken(accountId: String) -> String? { "fake-secret" }
     func removeAccount(accountId: String) async throws {
         state.withLock { value in

@@ -15,16 +15,20 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use wbmc_core::CoreError;
-use wbmc_core::auth::oauth::SignIn;
+use wbmc_core::auth::oauth::{CancelHandle, OAuthClient, SignIn};
 use wbmc_core::auth::{Endpoints, TokenManager};
 use wbmc_core::auth::{google, microsoft};
 use wbmc_core::events::{CoreEvent, EventSink, SyncStatus};
 use wbmc_core::mime::parse_message;
 use wbmc_core::model::{
-    Account, AccountId, Address, Folder, FolderId, MessageId, MessageSummary, ProviderKind,
+    Account, AccountId, Address, Folder, FolderId, FolderRole, MessageId, MessageSummary,
+    ProviderKind,
 };
-use wbmc_core::provider::{GraphProvider, ImapConfig, ImapProvider, MailProvider, Security};
+use wbmc_core::provider::{
+    GmailProvider, GraphProvider, ImapConfig, ImapProvider, MailProvider, Security,
+};
 use wbmc_core::secrets::{SecretStore, default_store, password_key, refresh_token_key};
+use wbmc_core::setup::{self, AccountSetup, DetectEnv};
 use wbmc_core::store::{BodyStore, Store};
 use wbmc_core::sync::SyncEngine;
 
@@ -91,7 +95,7 @@ type FfiResult<T> = std::result::Result<T, FfiError>;
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AccountInfo {
     pub id: String,
-    /// `"imap"` or `"microsoft"`.
+    /// `"imap"`, `"microsoft"` or `"google"`.
     pub kind: String,
     pub email: String,
     pub display_name: String,
@@ -113,6 +117,7 @@ pub struct FolderInfo {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MessageRow {
     pub id: String,
+    pub account_id: String,
     pub subject: String,
     pub from_name: String,
     pub from_email: String,
@@ -157,6 +162,31 @@ pub struct ImapAccountInput {
     pub password: String,
     pub smtp_host: String,
     pub smtp_port: u16,
+    pub smtp_security: String,
+}
+
+/// What [`WbmcCore::detect_account`] found for an address.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AccountSetupInfo {
+    /// `"microsoft"`, `"google"`, `"imap"` or `"unknown"`.
+    pub kind: String,
+    pub provider_name: String,
+    pub imap: Option<ImapSettings>,
+    pub app_password_url: Option<String>,
+}
+
+/// IMAP and SMTP settings from detection. `username` is the first alternative,
+/// with `email` / `local` expanded against the typed address.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ImapSettings {
+    pub host: String,
+    pub port: u16,
+    /// `"tls"`, `"starttls"` or `"none"`.
+    pub security: String,
+    pub username: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    /// `"tls"`, `"starttls"` or `"none"`.
     pub smtp_security: String,
 }
 
@@ -254,6 +284,10 @@ struct EventBridge {
     statuses: Mutex<HashMap<AccountId, &'static str>>,
     /// Accounts removed in this process. Late events from in-flight work are dropped.
     removed: Mutex<HashSet<AccountId>>,
+    /// Incremented by a successful sign-in. A sync captures the value it started with.
+    generations: Mutex<HashMap<AccountId, u64>>,
+    /// Generation captured when the current sync for the account started.
+    sync_generations: Mutex<HashMap<AccountId, u64>>,
 }
 
 impl EventBridge {
@@ -273,6 +307,49 @@ impl EventBridge {
 
     fn forget(&self, account_id: &AccountId) {
         self.statuses().remove(account_id);
+        self.generations().remove(account_id);
+        self.sync_generations().remove(account_id);
+    }
+
+    fn generations(&self) -> MutexGuard<'_, HashMap<AccountId, u64>> {
+        self.generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn sync_generations(&self) -> MutexGuard<'_, HashMap<AccountId, u64>> {
+        self.sync_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn generation(&self, account_id: &AccountId) -> u64 {
+        self.generations().get(account_id).copied().unwrap_or(0)
+    }
+
+    /// A successful sign-in advances the generation so an older sync cannot
+    /// put the account back into `needs_sign_in` or `error`.
+    fn bump_generation(&self, account_id: &AccountId) {
+        let mut generations = self.generations();
+        let next = generations
+            .get(account_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        generations.insert(account_id.clone(), next);
+    }
+
+    fn note_sync_generation(&self, account_id: &AccountId) {
+        let generation = self.generation(account_id);
+        self.sync_generations()
+            .insert(account_id.clone(), generation);
+    }
+
+    fn sync_is_stale(&self, account_id: &AccountId) -> bool {
+        let Some(started) = self.sync_generations().get(account_id).copied() else {
+            return false;
+        };
+        started < self.generation(account_id)
     }
 
     fn removed(&self) -> MutexGuard<'_, HashSet<AccountId>> {
@@ -291,6 +368,13 @@ impl EventSink for EventBridge {
         match &event {
             CoreEvent::SyncStatus { account_id, .. } | CoreEvent::FoldersChanged { account_id }
                 if self.is_removed(account_id) =>
+            {
+                return;
+            }
+            // A sync that started before sign-in must not undo the idle state.
+            CoreEvent::SyncStatus { account_id, status }
+                if self.sync_is_stale(account_id)
+                    && matches!(status, SyncStatus::NeedsSignIn | SyncStatus::Error { .. }) =>
             {
                 return;
             }
@@ -317,6 +401,13 @@ struct Inner {
     /// Running syncs, with the task's abort handle once it is spawned.
     syncing: Mutex<HashMap<AccountId, Option<tokio::task::AbortHandle>>>,
     runtime: tokio::runtime::Handle,
+    /// Clients used for interactive sign-in. Missing entries fall through to
+    /// `microsoft::client` / `google::client` so a missing configuration still errors.
+    oauth_clients: HashMap<ProviderKind, OAuthClient>,
+    graph_base: String,
+    gmail_base: String,
+    /// `None` uses [`DetectEnv::system`]. Tests inject a scripted environment.
+    detect_env: Mutex<Option<Arc<DetectEnv>>>,
 }
 
 /// Marks an account as syncing until dropped, so no error path leaves it stuck.
@@ -367,6 +458,7 @@ impl Inner {
             }
             syncing.insert(account_id.clone(), None);
         }
+        self.events.note_sync_generation(account_id);
         self.events.set_status(account_id, "syncing");
         Some(SyncGuard {
             inner: self.clone(),
@@ -492,9 +584,41 @@ impl Inner {
             ProviderKind::Microsoft => Ok(Box::new(GraphProvider::new(
                 account.id.clone(),
                 self.tokens.clone(),
-                Endpoints::default().graph,
+                self.graph_base.clone(),
             ))),
-            ProviderKind::Google => Err(invalid("Gmail support is not available yet")),
+            ProviderKind::Google => Ok(Box::new(GmailProvider::new(
+                account.id.clone(),
+                self.tokens.clone(),
+                self.gmail_base.clone(),
+            )?)),
+        }
+    }
+
+    fn detect_env(&self) -> FfiResult<Arc<DetectEnv>> {
+        if let Some(env) = self
+            .detect_env
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Ok(env);
+        }
+        Ok(Arc::new(DetectEnv::system()?))
+    }
+
+    async fn detect_setup(&self, email: &str) -> FfiResult<AccountSetup> {
+        let env = self.detect_env()?;
+        setup::detect(email, env.as_ref()).await.map_err(Into::into)
+    }
+
+    fn oauth_client(&self, kind: ProviderKind) -> FfiResult<OAuthClient> {
+        if let Some(client) = self.oauth_clients.get(&kind) {
+            return Ok(client.clone());
+        }
+        match kind {
+            ProviderKind::Microsoft => Ok(microsoft::client()?),
+            ProviderKind::Google => Ok(google::client()?),
+            ProviderKind::Imap => Err(invalid("unknown sign-in provider: imap")),
         }
     }
 
@@ -554,18 +678,51 @@ impl Inner {
     }
 
     async fn add_imap_account(self: Arc<Self>, input: ImapAccountInput) -> FfiResult<AccountInfo> {
-        let config = imap_config(&input)?;
-        // Verify the login before anything is saved. A rejected login is bad input here,
-        // not an existing account that needs to sign in again.
-        ImapProvider::new(config.clone(), input.password.clone())
-            .list_folders()
-            .await
-            .map_err(|error| match error {
-                CoreError::NeedsSignIn { .. } => {
-                    invalid("the IMAP server rejected the username or password")
+        let candidates = if input.username.trim().is_empty() {
+            match self.detect_setup(&input.email).await? {
+                AccountSetup::Imap {
+                    username_alternatives,
+                    ..
+                } => {
+                    let candidates = username_candidates(&input.email, &username_alternatives);
+                    if candidates.is_empty() {
+                        return Err(invalid("username is required"));
+                    }
+                    candidates
                 }
-                other => other.into(),
-            })?;
+                _ => return Err(invalid("username is required")),
+            }
+        } else {
+            vec![input.username.trim().to_string()]
+        };
+        // Verify the login before anything is saved. A rejected login is bad input here,
+        // not an existing account that needs to sign in again. An empty username tries
+        // each detected alternative (iCloud's local part, then the full address).
+        let mut config = None;
+        let mut rejected = false;
+        for username in candidates {
+            let mut attempt = input.clone();
+            attempt.username = username;
+            let parsed = imap_config(&attempt)?;
+            match ImapProvider::new(parsed.clone(), input.password.clone())
+                .list_folders()
+                .await
+            {
+                Ok(_) => {
+                    config = Some(parsed);
+                    break;
+                }
+                Err(CoreError::NeedsSignIn { .. }) => rejected = true,
+                Err(other) => return Err(other.into()),
+            }
+        }
+        let Some(config) = config else {
+            return Err(if rejected {
+                invalid("the IMAP server rejected the username or password")
+            } else {
+                invalid("username is required")
+            });
+        };
         let email = input.email.trim().to_string();
         let display_name = match input.display_name.trim() {
             "" => email.clone(),
@@ -636,17 +793,34 @@ impl Inner {
         Ok(self.account_info(&account))
     }
 
-    async fn finish_microsoft(self: Arc<Self>, sign_in: SignIn) -> FfiResult<AccountInfo> {
+    async fn detect_account(self: Arc<Self>, email: String) -> FfiResult<AccountSetupInfo> {
+        let setup = self.detect_setup(&email).await?;
+        Ok(setup_info(&email, setup))
+    }
+
+    async fn finish_oauth(
+        self: Arc<Self>,
+        kind: ProviderKind,
+        sign_in: SignIn,
+    ) -> FfiResult<AccountInfo> {
         let tokens = sign_in.finish(SIGN_IN_TIMEOUT).await?;
-        let email =
-            microsoft::account_email(&Endpoints::default().graph, &tokens.access_token).await?;
+        let email = match kind {
+            ProviderKind::Microsoft => {
+                microsoft::account_email(&self.graph_base, &tokens.access_token).await?
+            }
+            ProviderKind::Google => {
+                google::account_email(&self.gmail_base, &tokens.access_token).await?
+            }
+            ProviderKind::Imap => return Err(invalid("unknown sign-in provider: imap")),
+        };
         let store = self.store.clone();
         let manager = self.tokens.clone();
         let account = blocking(move || {
-            save_microsoft_account(&store, email, |id| manager.store(id, &tokens))
+            save_oauth_account(&store, kind, email, |id| manager.store(id, &tokens))
         })
         .await?;
-        // A re-sign-in clears any previous NeedsSignIn state.
+        // Bump first so a sync that is still failing cannot overwrite idle.
+        self.events.bump_generation(&account.id);
         self.events.set_status(&account.id, "idle");
         self.events.emit(CoreEvent::AccountsChanged);
         self.spawn_sync(&account.id);
@@ -686,23 +860,25 @@ impl Inner {
     }
 }
 
-/// Re-uses the Microsoft account with this email (case-insensitive) or inserts a new one,
+/// Re-uses the account of `kind` with this email (case-insensitive) or inserts a new one,
 /// then stores its tokens. A newly inserted row is deleted again if storing tokens fails.
-fn save_microsoft_account(
+fn save_oauth_account(
     store: &Store,
+    kind: ProviderKind,
     email: String,
     store_tokens: impl FnOnce(&AccountId) -> wbmc_core::Result<()>,
 ) -> wbmc_core::Result<Account> {
-    let existing = store.accounts()?.into_iter().find(|account| {
-        account.kind == ProviderKind::Microsoft && account.email.eq_ignore_ascii_case(&email)
-    });
+    let existing = store
+        .accounts()?
+        .into_iter()
+        .find(|account| account.kind == kind && account.email.eq_ignore_ascii_case(&email));
     if let Some(account) = existing {
         store_tokens(&account.id)?;
         return Ok(account);
     }
     let account = Account {
         id: AccountId::new(),
-        kind: ProviderKind::Microsoft,
+        kind,
         display_name: email.clone(),
         email,
         config: serde_json::json!({}),
@@ -710,7 +886,10 @@ fn save_microsoft_account(
     store.insert_account(&account)?;
     if let Err(error) = store_tokens(&account.id) {
         if let Err(cleanup) = store.delete_account(&account.id) {
-            tracing::warn!("could not roll back a new Microsoft account: {cleanup}");
+            tracing::warn!(
+                "could not roll back a new {} account: {cleanup}",
+                kind.as_str()
+            );
         }
         return Err(error);
     }
@@ -803,6 +982,89 @@ fn build_content(message: &MessageSummary, raw: &[u8]) -> MessageContent {
     }
 }
 
+fn security_name(security: Security) -> String {
+    match security {
+        Security::Tls => "tls",
+        Security::StartTls => "starttls",
+        Security::None => "none",
+    }
+    .to_string()
+}
+
+/// `email` and `local` are detection tokens, not mailbox names.
+fn expand_username(email: &str, alternative: &str) -> String {
+    let email = email.trim();
+    match alternative {
+        "email" => email.to_string(),
+        "local" => email
+            .split_once('@')
+            .map(|(local, _)| local.trim().to_string())
+            .filter(|local| !local.is_empty())
+            .unwrap_or_default(),
+        other => other.trim().to_string(),
+    }
+}
+
+fn username_candidates(email: &str, alternatives: &[String]) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for alternative in alternatives {
+        let username = expand_username(email, alternative);
+        if username.is_empty() || candidates.iter().any(|existing| existing == &username) {
+            continue;
+        }
+        candidates.push(username);
+    }
+    candidates
+}
+
+fn setup_info(email: &str, setup: AccountSetup) -> AccountSetupInfo {
+    match setup {
+        AccountSetup::Microsoft => AccountSetupInfo {
+            kind: "microsoft".into(),
+            provider_name: "Microsoft".into(),
+            imap: None,
+            app_password_url: None,
+        },
+        AccountSetup::Google => AccountSetupInfo {
+            kind: "google".into(),
+            provider_name: "Google".into(),
+            imap: None,
+            app_password_url: None,
+        },
+        AccountSetup::Unknown => AccountSetupInfo {
+            kind: "unknown".into(),
+            provider_name: String::new(),
+            imap: None,
+            app_password_url: None,
+        },
+        AccountSetup::Imap {
+            provider_name,
+            config,
+            username_alternatives,
+            app_password_url,
+        } => {
+            let username = username_candidates(email, &username_alternatives)
+                .into_iter()
+                .next()
+                .unwrap_or(config.username);
+            AccountSetupInfo {
+                kind: "imap".into(),
+                provider_name,
+                imap: Some(ImapSettings {
+                    host: config.host,
+                    port: config.port,
+                    security: security_name(config.security),
+                    username,
+                    smtp_host: config.smtp_host,
+                    smtp_port: config.smtp_port,
+                    smtp_security: security_name(config.smtp_security),
+                }),
+                app_password_url,
+            }
+        }
+    }
+}
+
 fn folder_info(folder: Folder) -> FolderInfo {
     FolderInfo {
         id: folder.id.as_str().to_string(),
@@ -818,6 +1080,7 @@ fn folder_info(folder: Folder) -> FolderInfo {
 fn message_row(message: MessageSummary) -> MessageRow {
     MessageRow {
         id: message.id.as_str().to_string(),
+        account_id: message.account_id.as_str().to_string(),
         subject: message.subject,
         from_name: message.from.name.unwrap_or_default(),
         from_email: message.from.email,
@@ -856,6 +1119,29 @@ impl WbmcCore {
         listener: Arc<dyn CoreListener>,
         secrets: Arc<dyn SecretStore>,
     ) -> FfiResult<Arc<Self>> {
+        let oauth_clients = [microsoft::client(), google::client()]
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|client| (client.kind, client))
+            .collect();
+        Self::open(
+            data_dir,
+            listener,
+            secrets,
+            oauth_clients,
+            Endpoints::default().graph,
+            google::DEFAULT_GMAIL_BASE.to_string(),
+        )
+    }
+
+    fn open(
+        data_dir: String,
+        listener: Arc<dyn CoreListener>,
+        secrets: Arc<dyn SecretStore>,
+        oauth_clients: HashMap<ProviderKind, OAuthClient>,
+        graph_base: String,
+        gmail_base: String,
+    ) -> FfiResult<Arc<Self>> {
         let data_dir = PathBuf::from(data_dir);
         std::fs::create_dir_all(&data_dir).map_err(CoreError::from)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -870,13 +1156,10 @@ impl WbmcCore {
             listener,
             statuses: Mutex::new(HashMap::new()),
             removed: Mutex::new(HashSet::new()),
+            generations: Mutex::new(HashMap::new()),
+            sync_generations: Mutex::new(HashMap::new()),
         });
-        let clients = [microsoft::client(), google::client()]
-            .into_iter()
-            .filter_map(Result::ok)
-            .map(|client| (client.kind, client))
-            .collect();
-        let tokens = Arc::new(TokenManager::new(secrets.clone(), clients));
+        let tokens = Arc::new(TokenManager::new(secrets.clone(), oauth_clients.clone()));
         let engine = SyncEngine::new(store.clone(), bodies, events.clone());
         let inner = Arc::new(Inner {
             store,
@@ -887,6 +1170,10 @@ impl WbmcCore {
             events,
             syncing: Mutex::new(HashMap::new()),
             runtime: runtime.handle().clone(),
+            oauth_clients,
+            graph_base,
+            gmail_base,
+            detect_env: Mutex::new(None),
         });
         Ok(Arc::new(Self {
             inner,
@@ -900,6 +1187,63 @@ impl WbmcCore {
         self.inner
             .syncing()
             .contains_key(&AccountId::from(account_id.to_string()))
+    }
+
+    /// Points detection at a scripted resolver and HTTP server.
+    #[cfg(test)]
+    pub(crate) fn set_detect_env(&self, env: DetectEnv) {
+        *self
+            .inner
+            .detect_env
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(env));
+    }
+}
+
+/// Wiremock bases for sign-in tests. Microsoft `Endpoints` plus the Google URLs,
+/// because one Microsoft endpoint pair cannot name the Gmail profile host.
+#[cfg(test)]
+pub(crate) struct TestEndpoints {
+    pub microsoft: Endpoints,
+    pub google_authorize_url: String,
+    pub google_token_url: String,
+    pub gmail_base: String,
+}
+
+#[cfg(test)]
+impl WbmcCore {
+    pub(crate) fn with_endpoints(
+        data_dir: String,
+        listener: Arc<dyn CoreListener>,
+        secrets: Arc<dyn SecretStore>,
+        endpoints: TestEndpoints,
+    ) -> FfiResult<Arc<Self>> {
+        let TestEndpoints {
+            microsoft,
+            google_authorize_url,
+            google_token_url,
+            gmail_base,
+        } = endpoints;
+        let graph_base = microsoft.graph.clone();
+        let microsoft_client = microsoft::client_with("test-client", microsoft)?;
+        let google_client = google::client_with(
+            "test-google",
+            "test-secret",
+            &google_authorize_url,
+            &google_token_url,
+        )?;
+        let oauth_clients = HashMap::from([
+            (ProviderKind::Microsoft, microsoft_client),
+            (ProviderKind::Google, google_client),
+        ]);
+        Self::open(
+            data_dir,
+            listener,
+            secrets,
+            oauth_clients,
+            graph_base,
+            gmail_base,
+        )
     }
 }
 
@@ -932,12 +1276,36 @@ impl WbmcCore {
         self.inner.run(inner.add_imap_account(input)).await
     }
 
-    pub fn begin_microsoft_sign_in(&self) -> FfiResult<Arc<MicrosoftSignIn>> {
-        let sign_in = SignIn::start(microsoft::client()?, None)?;
-        Ok(Arc::new(MicrosoftSignIn {
+    /// Looks up how to sign in to `email`. Bundled profiles return without network.
+    pub async fn detect_account(&self, email: String) -> FfiResult<AccountSetupInfo> {
+        let inner = self.inner.clone();
+        self.inner
+            .run(async move { inner.detect_account(email).await })
+            .await
+    }
+
+    /// Starts an interactive Microsoft or Google sign-in. `provider` is `"microsoft"` or `"google"`.
+    pub fn begin_sign_in(
+        &self,
+        provider: String,
+        login_hint: Option<String>,
+    ) -> FfiResult<Arc<OAuthSignIn>> {
+        let kind = match provider.as_str() {
+            "microsoft" => ProviderKind::Microsoft,
+            "google" => ProviderKind::Google,
+            other => {
+                return Err(invalid(format!("unknown sign-in provider: {other}")));
+            }
+        };
+        let client = self.inner.oauth_client(kind)?;
+        let sign_in = SignIn::start(client, login_hint.as_deref())?;
+        let cancel = sign_in.cancel_handle();
+        Ok(Arc::new(OAuthSignIn {
             inner: self.inner.clone(),
             url: sign_in.url(),
+            kind,
             sign_in: Mutex::new(Some(sign_in)),
+            cancel,
         }))
     }
 
@@ -955,6 +1323,21 @@ impl WbmcCore {
             Ok(folders) => folders.into_iter().map(folder_info).collect(),
             Err(error) => {
                 tracing::warn!("folders: {error}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Inbox messages across every account, newest first.
+    pub fn unified_messages(&self, offset: u32, limit: u32) -> Vec<MessageRow> {
+        match self
+            .inner
+            .store
+            .unified_messages(FolderRole::Inbox, offset, limit)
+        {
+            Ok(messages) => messages.into_iter().map(message_row).collect(),
+            Err(error) => {
+                tracing::warn!("unified_messages: {error}");
                 Vec::new()
             }
         }
@@ -1041,22 +1424,30 @@ impl WbmcCore {
     }
 }
 
-/// An interactive Microsoft sign-in: open `url()` in the browser, then await `finish()`.
+/// An interactive Microsoft or Google sign-in: open `url()` in the browser, then await `finish()`.
 #[derive(uniffi::Object)]
-pub struct MicrosoftSignIn {
+pub struct OAuthSignIn {
     inner: Arc<Inner>,
     url: String,
+    kind: ProviderKind,
     sign_in: Mutex<Option<SignIn>>,
+    cancel: CancelHandle,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
-impl MicrosoftSignIn {
+impl OAuthSignIn {
     pub fn url(&self) -> String {
         self.url.clone()
     }
 
+    /// Stops `finish`. A finish that is waiting returns `InvalidInput("Sign-in was cancelled.")`.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
     /// Waits up to five minutes for the browser redirect, then adds (or re-authorises)
-    /// the account and starts a background sync.
+    /// the account and starts a background sync. The saved address is the one the
+    /// provider reports, not the login hint.
     pub async fn finish(&self) -> FfiResult<AccountInfo> {
         let sign_in = self
             .sign_in
@@ -1065,7 +1456,10 @@ impl MicrosoftSignIn {
             .take()
             .ok_or_else(|| invalid("this sign-in has already finished"))?;
         let inner = self.inner.clone();
-        self.inner.run(inner.finish_microsoft(sign_in)).await
+        let kind = self.kind;
+        self.inner
+            .run(async move { inner.finish_oauth(kind, sign_in).await })
+            .await
     }
 }
 
