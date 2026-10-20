@@ -288,7 +288,7 @@ impl MailProvider for ImapProvider {
             Ok(results) => results,
             Err(error) => message_remote_ids
                 .iter()
-                .map(|id| (id.clone(), Err(copy_error(&error))))
+                .map(|id| (id.clone(), Err(error.clone())))
                 .collect(),
         }
     }
@@ -681,16 +681,28 @@ async fn fetch_bodies(
     }
     if let Err(error) = examine(session, folder_remote_id).await {
         for (index, _) in &pending {
-            slots[*index] = Some(Err(copy_error(&error)));
+            slots[*index] = Some(Err(error.clone()));
         }
         return finish_bodies(message_remote_ids, slots);
     }
+    // A timeout or a dropped connection leaves the stream out of step, so later
+    // chunks on this session would be garbage. Mark them with the same error.
+    let mut blocked: Option<CoreError> = None;
     for chunk in pending.chunks(BODY_BATCH) {
+        if let Some(error) = &blocked {
+            for (index, _) in chunk {
+                slots[*index] = Some(Err(error.clone()));
+            }
+            continue;
+        }
         let uids: Vec<u32> = chunk.iter().map(|(_, uid)| *uid).collect();
         match fetch_query(session, &uid_set(&uids), "BODY.PEEK[]").await {
             Err(error) => {
                 for (index, _) in chunk {
-                    slots[*index] = Some(Err(copy_error(&error)));
+                    slots[*index] = Some(Err(error.clone()));
+                }
+                if matches!(error, CoreError::Network(_)) {
+                    blocked = Some(error);
                 }
             }
             Ok(fetches) => {
@@ -733,19 +745,6 @@ fn finish_bodies(
             )
         })
         .collect()
-}
-
-fn copy_error(error: &CoreError) -> CoreError {
-    match error {
-        CoreError::Network(message) => CoreError::Network(message.clone()),
-        CoreError::Protocol(message) => CoreError::Protocol(message.clone()),
-        CoreError::Storage(message) => CoreError::Storage(message.clone()),
-        CoreError::NeedsSignIn { account_id } => CoreError::NeedsSignIn {
-            account_id: account_id.clone(),
-        },
-        CoreError::NotFound(message) => CoreError::NotFound(message.clone()),
-        CoreError::InvalidInput(message) => CoreError::InvalidInput(message.clone()),
-    }
 }
 
 struct SummaryRow {
@@ -1334,10 +1333,11 @@ fn map_login(err: async_imap::error::Error, username: &str) -> CoreError {
 
 /// `no_response` is true for `NO` and false for `BAD`.
 ///
-/// NeedsSignIn is only a bad password: `NO [AUTHENTICATIONFAILED]`,
-/// `NO [AUTHORIZATIONFAILED]`, or a `NO` with no response code. Throttling
-/// (`[UNAVAILABLE]`, `[LIMIT]`, `[INUSE]`, `[EXPIRED]`, `[SERVERBUG]`, or text
-/// containing "too many" / "try again") is a retryable network error.
+/// NeedsSignIn is a bad password or a sign-in prompt: `NO [AUTHENTICATIONFAILED]`,
+/// `NO [AUTHORIZATIONFAILED]`, `NO [ALERT]` (Gmail's "log in via your web browser"),
+/// or a `NO` with no response code. Throttling (`[UNAVAILABLE]`, `[LIMIT]`,
+/// `[INUSE]`, `[EXPIRED]`, `[SERVERBUG]`, or text containing "too many" /
+/// "try again") is a retryable network error.
 fn map_login_response(raw: &str, username: &str, no_response: bool) -> CoreError {
     let text = imap_info_text(raw);
     let code = response_code(&text);
@@ -1354,8 +1354,11 @@ fn map_login_response(raw: &str, username: &str, no_response: bool) -> CoreError
     }
     let lowered = text.to_ascii_lowercase();
     let throttled = lowered.contains("too many") || lowered.contains("try again");
-    let other_code = code.is_some() || raw.contains("code: Some(");
-    if other_code || throttled || !no_response {
+    // `async-imap` formats a parsed ALERT as `code: Some(Alert)`, not `[ALERT]`.
+    let alert_only = code.as_deref() == Some("ALERT") || raw.contains("code: Some(Alert)");
+    let other_code = (code.is_some() && !alert_only)
+        || (raw.contains("code: Some(") && !raw.contains("code: Some(Alert)"));
+    if throttled || other_code || !no_response {
         return CoreError::Network(BUSY_SERVER.into());
     }
     needs_sign_in()
@@ -1576,7 +1579,7 @@ mod tests {
     };
     use crate::CoreError;
     use crate::model::FolderRole;
-    use crate::provider::FolderSyncState;
+    use crate::provider::{FolderSyncState, MailProvider};
 
     fn imap_state(uid_validity: u32, lowest_uid: u32, highest_uid: u32) -> FolderSyncState {
         FolderSyncState::Imap {
@@ -1865,6 +1868,91 @@ mod tests {
             "Too many simultaneous connections",
         ))));
         assert_busy(login_no("Please try again later"));
+        assert_busy(login_no("[ALERT] Please try again later"));
+    }
+
+    #[test]
+    fn map_login_alert_needs_sign_in() {
+        assert_needs_sign_in(login_no("[ALERT] Please log in via your web browser"));
+        assert_needs_sign_in(login_no("[alert] Web login required"));
+        assert_needs_sign_in(login_no(
+            "code: Some(Alert), info: Some(\"Please log in via your web browser\")",
+        ));
+    }
+
+    /// A dropped connection on the first body chunk must not start the next one.
+    #[tokio::test]
+    async fn fetch_bodies_stops_after_network_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = fetches.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.write_all(b"* OK ready\r\n").await;
+            loop {
+                let mut line = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    line.push(byte[0]);
+                    if line.ends_with(b"\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&line);
+                let tag = text.split(' ').next().unwrap_or("A0001");
+                if text.contains("FETCH") {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // An unfinished line plus EOF is an I/O error, not an empty fetch.
+                    let _ = socket.write_all(b"* 1 FETCH (").await;
+                    return;
+                }
+                let reply = if text.contains("EXAMINE") {
+                    format!(
+                        "* FLAGS (\\Seen)\r\n* 25 EXISTS\r\n* OK [UIDVALIDITY 1] UIDs valid\r\n{tag} OK [READ-ONLY] EXAMINE completed\r\n"
+                    )
+                } else {
+                    format!("{tag} OK done\r\n")
+                };
+                if socket.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let provider = ImapProvider::new(
+            ImapConfig {
+                host: "127.0.0.1".into(),
+                port,
+                security: Security::None,
+                username: "alice".into(),
+                smtp_host: "127.0.0.1".into(),
+                smtp_port: 1,
+                smtp_security: Security::None,
+            },
+            "secret".into(),
+        );
+        let ids: Vec<String> = (1..=25).map(|uid| uid.to_string()).collect();
+        let started = Instant::now();
+        let fetched = provider.fetch_raw_many("INBOX", &ids).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "batch took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(fetched.len(), 25);
+        for (id, result) in fetched {
+            match result {
+                Err(CoreError::Network(_)) => {}
+                other => panic!("uid {id}: expected a network error, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

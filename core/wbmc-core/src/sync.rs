@@ -36,6 +36,7 @@ pub struct SyncEngine {
     store: Arc<Store>,
     bodies: Arc<BodyStore>,
     events: Arc<dyn EventSink>,
+    provider_timeout: Duration,
 }
 
 impl SyncEngine {
@@ -44,7 +45,13 @@ impl SyncEngine {
             store,
             bodies,
             events,
+            provider_timeout: PROVIDER_CALL_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    fn set_provider_call_timeout(&mut self, timeout: Duration) {
+        self.provider_timeout = timeout;
     }
 
     pub async fn sync_account(&self, account: &Account, provider: &dyn MailProvider) -> Result<()> {
@@ -275,7 +282,20 @@ impl SyncEngine {
             .iter()
             .map(|message| message.remote_id.clone())
             .collect();
-        let fetched = provider.fetch_raw_many(&folder.remote_id, &ids).await;
+        let fetched = match tokio::time::timeout(
+            self.provider_timeout,
+            provider.fetch_raw_many(&folder.remote_id, &ids),
+        )
+        .await
+        {
+            Ok(fetched) => fetched,
+            Err(_) => {
+                tracing::warn!("body prefetch timed out");
+                ids.into_iter()
+                    .map(|id| (id, Err(CoreError::Network("timed out".into()))))
+                    .collect()
+            }
+        };
         let mut needs_sign_in = None;
         for (message, (_remote_id, result)) in pending.iter().zip(fetched) {
             match result {
@@ -777,6 +797,28 @@ mod tests {
                 "missing body for {}",
                 row.remote_id
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_hang_finishes_within_deadline() {
+        let mut h = Harness::new();
+        let deadline = std::time::Duration::from_millis(80);
+        h.engine.set_provider_call_timeout(deadline);
+        let provider = provider(3, FolderRole::Inbox);
+        provider.set_hang_fetch_raw_many(true);
+        let started = std::time::Instant::now();
+        h.engine.sync_account(&h.account, &provider).await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "prefetch hung for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(h.statuses().last(), Some(&SyncStatus::Idle));
+        let rows = h.store.messages(&h.folder("inbox").id, 0, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert!(h.bodies.get(&h.account.id, &row.id).unwrap().is_none());
         }
     }
 
