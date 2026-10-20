@@ -1,6 +1,8 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import AppKit
 import Foundation
+import SwiftUI
 import Synchronization
 import Testing
 import WBMCCore
@@ -15,6 +17,8 @@ final class FakeCore: WbmcCoreProtocol, Sendable {
         var unreadCount: UInt32 = 3
         var customFolders: [String: [FolderInfo]] = [:]
         var removedAccountIDs: [String] = []
+        var unifiedRows: [MessageRow] = []
+        var unifiedRequests: [(UInt32, UInt32)] = []
     }
     let state = Mutex(State())
     let contentProvider: @Sendable (String) async throws -> MessageContent
@@ -34,8 +38,8 @@ final class FakeCore: WbmcCoreProtocol, Sendable {
         inbox.unreadCount = unread
         return [inbox, Self.folder("other", account: accountId)]
     }
-    static func folder(_ id: String, account: String = "a") -> FolderInfo {
-        FolderInfo(id: id, accountId: account, name: id, role: id == "inbox" ? "inbox" : "other",
+    static func folder(_ id: String, account: String = "a", role: String? = nil) -> FolderInfo {
+        FolderInfo(id: id, accountId: account, name: id, role: role ?? (id == "inbox" ? "inbox" : "other"),
                    parentId: nil, unreadCount: 3, totalCount: 250)
     }
     func messages(folderId: String, offset: UInt32, limit: UInt32) -> [MessageRow] {
@@ -60,7 +64,15 @@ final class FakeCore: WbmcCoreProtocol, Sendable {
     func detectAccount(email: String) async throws -> AccountSetupInfo {
         throw FfiError.InvalidInput(message: "not used")
     }
-    func unifiedMessages(offset: UInt32, limit: UInt32) -> [MessageRow] { [] }
+    func unifiedMessages(offset: UInt32, limit: UInt32) -> [MessageRow] {
+        state.withLock { value in
+            value.unifiedRequests.append((offset, limit))
+            let rows = value.unifiedRows
+            let start = min(Int(offset), rows.count)
+            let end = min(rows.count, start + Int(limit))
+            return Array(rows[start..<end])
+        }
+    }
     func debugRefreshToken(accountId: String) -> String? { "fake-secret" }
     func removeAccount(accountId: String) async throws {
         state.withLock { value in
@@ -203,6 +215,170 @@ struct AppModelTests {
         #expect(!model.isLoadingContent)
     }
 
+    @Test func unifiedInboxLoadsAcrossAccounts() {
+        let core = FakeCore()
+        core.state.withLock { value in
+            value.accounts.append(AccountInfo(id: "b", kind: "imap", email: "bob@wbmc.test", displayName: "Bob", status: "idle"))
+            var alice = FakeCore.folder("a-inbox", account: "a", role: "inbox")
+            alice.unreadCount = 2
+            var bob = FakeCore.folder("b-inbox", account: "b", role: "inbox")
+            bob.unreadCount = 4
+            value.customFolders = ["a": [alice], "b": [bob]]
+            value.unifiedRows = [Self.row("m-a", account: "a"), Self.row("m-b", account: "b", date: 1)]
+        }
+        let model = AppModel(core: core)
+        model.load()
+        #expect(model.showsUnifiedInbox)
+        #expect(model.unifiedUnreadCount == 6)
+        let folderMessages = core.state.withLock { $0.messageRequests.count }
+        model.select(folder: AppModel.unifiedInboxID)
+        #expect(model.selectedFolderID == AppModel.unifiedInboxID)
+        #expect(model.messages.map(\.accountId) == ["a", "b"])
+        let requests = core.state.withLock { $0.unifiedRequests }
+        #expect(requests.count == 1)
+        #expect(requests.first?.0 == 0)
+        #expect(requests.first?.1 == 100)
+        #expect(core.state.withLock { $0.messageRequests.count } == folderMessages)
+        model.handle(.foldersChanged(accountId: "a"))
+        #expect(model.selectedFolderID == AppModel.unifiedInboxID)
+    }
+
+    @Test func inboxChangeReloadsUnified() {
+        let core = FakeCore()
+        core.state.withLock { value in
+            value.accounts.append(AccountInfo(id: "b", kind: "imap", email: "bob@wbmc.test", displayName: "Bob", status: "idle"))
+            value.customFolders = [
+                "a": [FakeCore.folder("a-inbox", account: "a", role: "inbox")],
+                "b": [
+                    FakeCore.folder("b-inbox", account: "b", role: "inbox"),
+                    FakeCore.folder("b-sent", account: "b", role: "sent"),
+                ],
+            ]
+            value.unifiedRows = [Self.row("m-a", account: "a")]
+        }
+        let model = AppModel(core: core)
+        model.load()
+        model.select(folder: AppModel.unifiedInboxID)
+        let loaded = core.state.withLock { $0.unifiedRequests.count }
+        model.handle(.messagesChanged(folderId: "b-sent"))
+        #expect(core.state.withLock { $0.unifiedRequests.count } == loaded)
+        core.state.withLock { $0.unifiedRows.append(Self.row("m-b", account: "b")) }
+        model.handle(.messagesChanged(folderId: "a-inbox"))
+        #expect(core.state.withLock { $0.unifiedRequests.count } == loaded + 1)
+        #expect(model.messages.map(\.id) == ["m-a", "m-b"])
+        let reloaded = core.state.withLock { $0.unifiedRequests.last }
+        #expect(reloaded?.0 == 0)
+        #expect(reloaded?.1 == 100)
+    }
+
+    @Test func unifiedHiddenWithOneAccount() {
+        let core = FakeCore()
+        let model = AppModel(core: core)
+        model.load()
+        #expect(model.accounts.count == 1)
+        #expect(!model.showsUnifiedInbox)
+    }
+
+    @Test func googleNeedsSignInOffersSignInAgain() {
+        var account = AccountInfo(id: "g", kind: "google", email: "reader@gmail.com", displayName: "Reader", status: "needs_sign_in")
+        #expect(Sidebar.offersSignInAgain(for: account))
+        #expect(Sidebar.signInAgain(for: account)?.provider == "google")
+        #expect(Sidebar.signInAgain(for: account)?.loginHint == "reader@gmail.com")
+        account.status = "idle"
+        #expect(!Sidebar.offersSignInAgain(for: account))
+        #expect(Sidebar.signInAgain(for: account) == nil)
+
+        let core = FakeCore()
+        core.state.withLock { $0.accounts[0].kind = "google" }
+        let model = AppModel(core: core)
+        model.load()
+        model.handle(.syncStatus(accountId: "a", status: .needsSignIn))
+        #expect(model.accountErrors["a"] == "Please sign in to this account again.")
+    }
+
+    @Test func cancelCancelsRustFlow() throws {
+        let flow = RecordingOAuthFlow()
+        let starter = RecordingSignInStarter(flow: flow)
+        let session = AddAccountSession(core: FakeCore(), signInStarter: starter)
+        let url = try session.startOAuth(provider: "google", loginHint: "reader@gmail.com")
+        #expect(url.absoluteString == "https://accounts.example/oauth")
+        let calls = starter.calls
+        #expect(calls.count == 1)
+        #expect(calls.first?.0 == "google")
+        #expect(calls.first?.1 == "reader@gmail.com")
+        session.cancel()
+        #expect(flow.cancelled)
+        session.cancel()
+        #expect(flow.cancelCount == 1)
+    }
+
+    @Test func detectionResultDrivesState() {
+        let microsoft = AccountSetupInfo(kind: "microsoft", providerName: "Microsoft", imap: nil, appPasswordUrl: nil)
+        #expect(AddAccountState.from(microsoft, email: "ada@outlook.com") == .oauth(provider: "microsoft", providerName: "Microsoft"))
+
+        let google = AccountSetupInfo(kind: "google", providerName: "Google", imap: nil, appPasswordUrl: nil)
+        #expect(AddAccountState.from(google, email: "ada@gmail.com") == .oauth(provider: "google", providerName: "Google"))
+
+        let settings = Self.imapSettings(username: "ada")
+        let imap = AccountSetupInfo(kind: "imap", providerName: "GreenMail", imap: settings, appPasswordUrl: nil)
+        #expect(AddAccountState.from(imap, email: "ada@wbmc.test") == .password(providerName: "GreenMail", settings: settings))
+
+        let appPassword = AccountSetupInfo(kind: "imap", providerName: "iCloud", imap: settings, appPasswordUrl: "https://appleid.apple.com")
+        #expect(AddAccountState.from(appPassword, email: "ada@icloud.com")
+                == .appPassword(providerName: "iCloud", url: "https://appleid.apple.com", settings: settings))
+
+        let unknown = AccountSetupInfo(kind: "unknown", providerName: "", imap: nil, appPasswordUrl: nil)
+        #expect(AddAccountState.from(unknown, email: "ada@example.com") == .unknown(domain: "example.com"))
+    }
+
+    @Test func captureAddAccountStates() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/claude-501/-Users-ajthom90-projects-wbmc/72b338b2-2fb2-4e6b-8675-4795623d72f7/scratchpad/m2-t8-shots", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let dataDir = FileManager.default.temporaryDirectory.appendingPathComponent("WBMC-shots-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dataDir) }
+        let core = try WbmcCore(dataDir: dataDir.path, listener: ModelListener())
+        let model = AppModel(core: core)
+        let email = "alice@wbmc.test"
+        let setup = try await core.detectAccount(email: email)
+        let settings = try #require(setup.imap)
+        func draft(_ state: AddAccountState, showSettings: Bool = false) -> AddAccountDraft {
+            AddAccountDraft(
+                state: state, email: email, host: settings.host, port: String(settings.port), security: settings.security,
+                smtpHost: settings.smtpHost, smtpPort: String(settings.smtpPort), smtpSecurity: settings.smtpSecurity,
+                username: settings.username, detectedUsername: settings.username, showServerSettings: showSettings)
+        }
+        let shots: [(String, AddAccountDraft)] = [
+            ("email", AddAccountDraft(state: .email, email: email)),
+            ("detecting", draft(.detecting)),
+            ("oauth-google", draft(.oauth(provider: "google", providerName: "Google"))),
+            ("oauth-microsoft", draft(.oauth(provider: "microsoft", providerName: "Microsoft"))),
+            ("app-password", draft(.appPassword(providerName: "iCloud", url: "https://support.apple.com/en-us/102654", settings: settings))),
+            ("password", draft(.password(providerName: setup.providerName, settings: settings))),
+            ("password-server-settings", draft(.password(providerName: setup.providerName, settings: settings), showSettings: true)),
+            ("unknown", draft(.unknown(domain: "wbmc.test"))),
+            ("manual", draft(.manual(settings: settings))),
+            ("signing-in", draft(.signingIn)),
+            ("adding", draft(.adding)),
+        ]
+        let heights: [String: CGFloat] = [
+            "email": 230, "detecting": 200, "oauth-google": 190, "oauth-microsoft": 190,
+            "app-password": 420, "password": 340, "password-server-settings": 820,
+            "unknown": 190, "manual": 700, "signing-in": 200, "adding": 200,
+        ]
+        for (name, seed) in shots {
+            let data = try renderAddAccountPNG(AddAccount(model: model, draft: seed), height: heights[name] ?? 400)
+            try data.write(to: directory.appendingPathComponent("\(name).png"))
+            #expect(data.count > 1000, "\(name) screenshot was empty")
+        }
+    }
+
+    @Test func accountHueIsStable() {
+        #expect(accountHueDegrees(accountId: "account-a") == 14)
+        #expect(accountHueDegrees(accountId: "account-b") == 283)
+        #expect(accountHueDegrees(accountId: "account-a") == accountHueDegrees(accountId: "account-a"))
+    }
+
     @Test func selectMessageLoadsContent() async {
         let model = AppModel(core: FakeCore())
         model.select(folder: "inbox")
@@ -212,6 +388,73 @@ struct AppModelTests {
         await model.select(message: nil)
         #expect(model.content == nil)
     }
+}
+
+@MainActor
+private func renderAddAccountPNG(_ view: AddAccount, height: CGFloat) throws -> Data {
+    let host = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)))
+    let size = NSSize(width: 540, height: height)
+    host.frame = NSRect(origin: .zero, size: size)
+    let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    window.contentView = host
+    window.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+    host.layoutSubtreeIfNeeded()
+    window.displayIfNeeded()
+    host.displayIfNeeded()
+    guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    host.cacheDisplay(in: host.bounds, to: rep)
+    guard let png = rep.representation(using: .png, properties: [:]) else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    return png
+}
+
+private extension AppModelTests {
+    static func row(_ id: String, account: String, date: Int64 = 0) -> MessageRow {
+        MessageRow(id: id, accountId: account, subject: "Subject \(id)", fromName: "Sender", fromEmail: "sender@wbmc.test",
+                   dateMs: date, snippet: "Preview", isRead: false, isFlagged: false, hasAttachments: false)
+    }
+
+    static func imapSettings(username: String) -> ImapSettings {
+        ImapSettings(host: "localhost", port: 3143, security: "none", username: username,
+                     smtpHost: "localhost", smtpPort: 3025, smtpSecurity: "none")
+    }
+}
+
+final class RecordingOAuthFlow: OAuthSignInFlow, @unchecked Sendable {
+    private let state = Mutex((cancelled: false, count: 0))
+
+    func url() -> String { "https://accounts.example/oauth" }
+
+    func finish() async throws -> AccountInfo {
+        AccountInfo(id: "new", kind: "google", email: "reader@gmail.com", displayName: "Reader", status: "idle")
+    }
+
+    func cancel() {
+        state.withLock { value in
+            value.cancelled = true
+            value.count += 1
+        }
+    }
+
+    var cancelled: Bool { state.withLock { $0.cancelled } }
+    var cancelCount: Int { state.withLock { $0.count } }
+}
+
+final class RecordingSignInStarter: SignInStarter, @unchecked Sendable {
+    let flow: RecordingOAuthFlow
+    private let recorded = Mutex([(String, String?)]())
+
+    init(flow: RecordingOAuthFlow) { self.flow = flow }
+
+    func start(provider: String, loginHint: String?) throws -> any OAuthSignInFlow {
+        recorded.withLock { $0.append((provider, loginHint)) }
+        return flow
+    }
+
+    var calls: [(String, String?)] { recorded.withLock { $0 } }
 }
 
 private actor ContentGate {

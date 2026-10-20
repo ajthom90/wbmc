@@ -14,14 +14,21 @@ protocol OAuthSignInFlow: AnyObject, Sendable {
 extension OAuthSignIn: OAuthSignInFlow {}
 
 protocol SignInStarter: Sendable {
-    func start() throws -> any OAuthSignInFlow
+    func start(provider: String, loginHint: String?) throws -> any OAuthSignInFlow
 }
 
 struct CoreSignInStarter: SignInStarter {
     let core: any CoreClient
-    func start() throws -> any OAuthSignInFlow {
-        try core.beginSignIn(provider: "microsoft", loginHint: nil)
+    func start(provider: String, loginHint: String?) throws -> any OAuthSignInFlow {
+        try core.beginSignIn(provider: provider, loginHint: loginHint)
     }
+}
+
+func needsSignInMessage(kind: String) -> String {
+    if kind == "microsoft" || kind == "google" {
+        return "Please sign in to this account again."
+    }
+    return "Sign-in failed. Add the account again with the new password to update it."
 }
 
 func friendlyError(_ error: any Error) -> String {

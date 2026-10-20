@@ -17,10 +17,20 @@ final class AppModel {
     var errorMessage: String?
     private(set) var accountErrors: [String: String] = [:]
 
+    static let unifiedInboxID = "unified:inbox"
+
     let core: any CoreClient
     let signInStarter: any SignInStarter
     private var loadedLimit: UInt32 = 100
     private var contentRequest = UUID()
+
+    var showsUnifiedInbox: Bool { accounts.count >= 2 }
+
+    var unifiedUnreadCount: Int {
+        folders.values.joined().reduce(0) { total, folder in
+            folder.role == "inbox" ? total + Int(folder.unreadCount) : total
+        }
+    }
 
     init(core: any CoreClient, signInStarter: (any SignInStarter)? = nil) {
         self.core = core
@@ -39,16 +49,16 @@ final class AppModel {
         selectedFolderID = folder
         clearMessage()
         loadedLimit = 100
-        messages = folder.map { core.messages(folderId: $0, offset: 0, limit: 100) } ?? []
+        messages = page(offset: 0, limit: 100)
         canLoadMore = messages.count == 100
     }
 
     func loadMore() {
-        guard let folder = selectedFolderID, canLoadMore else { return }
-        let page = core.messages(folderId: folder, offset: UInt32(messages.count), limit: 100)
-        messages.append(contentsOf: page)
+        guard selectedFolderID != nil, canLoadMore else { return }
+        let next = page(offset: UInt32(messages.count), limit: 100)
+        messages.append(contentsOf: next)
         loadedLimit = UInt32(messages.count)
-        canLoadMore = page.count == 100
+        canLoadMore = next.count == 100
     }
 
     func select(message: String?) async {
@@ -96,9 +106,10 @@ final class AppModel {
             folders[accountID] = core.folders(accountId: accountID)
             validateFolderSelection()
         case .messagesChanged(let folderID):
-            if folderID == selectedFolderID {
+            let reloadsUnified = selectedFolderID == Self.unifiedInboxID && isInbox(folderID)
+            if folderID == selectedFolderID || reloadsUnified {
                 let count = max(100, loadedLimit)
-                messages = core.messages(folderId: folderID, offset: 0, limit: count)
+                messages = page(offset: 0, limit: count)
                 canLoadMore = messages.count == Int(count)
                 if let id = selectedMessageID, !messages.contains(where: { $0.id == id }) { clearMessage() }
             }
@@ -119,9 +130,7 @@ final class AppModel {
                 accountErrors[accountID] = message
             case .needsSignIn:
                 accounts[index].status = "needs_sign_in"
-                accountErrors[accountID] = accounts[index].kind == "microsoft"
-                    ? "Please sign in to this account again."
-                    : "Sign-in failed. Add the account again with the new password to update it."
+                accountErrors[accountID] = needsSignInMessage(kind: accounts[index].kind)
             }
         }
     }
@@ -134,8 +143,25 @@ final class AppModel {
         errorMessage = nil
     }
 
+    private func page(offset: UInt32, limit: UInt32) -> [MessageRow] {
+        guard let folder = selectedFolderID else { return [] }
+        if folder == Self.unifiedInboxID {
+            return core.unifiedMessages(offset: offset, limit: limit)
+        }
+        return core.messages(folderId: folder, offset: offset, limit: limit)
+    }
+
+    private func isInbox(_ folderID: String) -> Bool {
+        folders.values.joined().contains { $0.id == folderID && $0.role == "inbox" }
+    }
+
     private func validateFolderSelection() {
-        if let id = selectedFolderID, !folders.values.joined().contains(where: { $0.id == id }) {
+        guard let id = selectedFolderID else { return }
+        if id == Self.unifiedInboxID {
+            if !showsUnifiedInbox { select(folder: nil) }
+            return
+        }
+        if !folders.values.joined().contains(where: { $0.id == id }) {
             select(folder: nil)
         }
     }

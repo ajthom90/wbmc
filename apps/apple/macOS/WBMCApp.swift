@@ -62,14 +62,17 @@ private struct ReaderWindow: View {
     let model: AppModel
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var showingAddAccount = false
-    @State private var signingInAgain = false
+    @State private var resumeAccount: AccountInfo?
     #if DEBUG
     @State private var showingTokens = false
     #endif
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            Sidebar(model: model) { signingInAgain = true; showingAddAccount = true }
+            Sidebar(model: model) { account in
+                resumeAccount = account
+                showingAddAccount = true
+            }
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220)
         } content: {
             MessageList(model: model).navigationSplitViewColumnWidth(min: 260, ideal: 330)
@@ -81,11 +84,16 @@ private struct ReaderWindow: View {
             ToolbarItemGroup {
                 Button { Task { await model.refresh() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                     .help("Refresh")
-                Button { signingInAgain = false; showingAddAccount = true } label: { Label("Add Account", systemImage: "plus") }
+                Button {
+                    resumeAccount = nil
+                    showingAddAccount = true
+                } label: { Label("Add Account", systemImage: "plus") }
                     .help("Add Account")
             }
         }
-        .sheet(isPresented: $showingAddAccount) { AddAccount(model: model, startWithMicrosoft: signingInAgain) }
+        .sheet(isPresented: $showingAddAccount, onDismiss: { resumeAccount = nil }) {
+            AddAccount(model: model, resume: resumeAccount)
+        }
         #if DEBUG
         .onReceive(NotificationCenter.default.publisher(for: .copyRefreshToken)) { _ in showingTokens = true }
         .sheet(isPresented: $showingTokens) { RefreshTokenSheet(model: model) }
